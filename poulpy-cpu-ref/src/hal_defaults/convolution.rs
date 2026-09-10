@@ -17,7 +17,8 @@ use crate::reference::{
     ntt4x30::{
         NttAddAssign, NttCFromB, NttDFTExecute, NttFromZnx64, NttMulBbc1ColX2, NttPackLeft1BlkX2,
         convolution::{
-            CNV_ACC_GROUP, ntt4x30_cnv_accumulate_dft, ntt4x30_cnv_accumulate_dft_tmp_bytes, ntt4x30_cnv_apply_dft,
+            CNV_ACC_GROUP, ntt4x30_cnv_accumulate_dft, ntt4x30_cnv_accumulate_dft_dual,
+            ntt4x30_cnv_accumulate_dft_dual_tmp_bytes, ntt4x30_cnv_accumulate_dft_tmp_bytes, ntt4x30_cnv_apply_dft,
             ntt4x30_cnv_apply_dft_accumulate, ntt4x30_cnv_apply_dft_tmp_bytes, ntt4x30_cnv_by_const_apply,
             ntt4x30_cnv_by_const_apply_add, ntt4x30_cnv_by_const_apply_tmp_bytes, ntt4x30_cnv_pairwise_apply_dft,
             ntt4x30_cnv_pairwise_apply_dft_tmp_bytes, ntt4x30_cnv_prepare_left, ntt4x30_cnv_prepare_left_tmp_bytes,
@@ -592,6 +593,43 @@ where
         let bytes = ntt4x30_cnv_accumulate_dft_tmp_bytes(res_ref.size(), 0, 0);
         let (tmp, _) = take_host_typed::<BE, u8>(scratch.borrow(), bytes);
         ntt4x30_cnv_accumulate_dft::<BE>(module, cnv_offset, &mut res_ref, res_col, terms, tmp);
+    }
+
+    fn cnv_accumulate_dft_dual_tmp_bytes_default(
+        _module: &Module<BE>,
+        _cnv_offset: usize,
+        res_size: usize,
+        a_size: usize,
+        b_size: usize,
+    ) -> usize
+    where
+        BE: Backend<DftWord = Q120bScalar, ZnxWord = i64>,
+    {
+        ntt4x30_cnv_accumulate_dft_dual_tmp_bytes(res_size, a_size, b_size)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cnv_accumulate_dft_dual_default<'a, R>(
+        module: &Module<BE>,
+        cnv_offset: usize,
+        res: &mut R,
+        res_col_0: usize,
+        terms_0: &[poulpy_hal::layouts::CnvDftAccTerm<'a, BE>],
+        res_col_1: usize,
+        terms_1: &[poulpy_hal::layouts::CnvDftAccTerm<'a, BE>],
+        scratch: &mut ScratchArena<'_, BE>,
+    ) where
+        Module<BE>: NttModuleHandle,
+        BE: Backend<DftWord = Q120bScalar, ZnxWord = i64> + 'a,
+        for<'x> BE::BufMut<'x>: HostBufMut<'x>,
+        for<'x> <BE as Backend>::BufRef<'x>: HostDataRef,
+        for<'x> <BE as Backend>::BufMut<'x>: poulpy_hal::layouts::HostDataMut,
+        R: VecZnxDftToBackendMut<BE>,
+    {
+        let mut res_ref = res.to_backend_mut();
+        let bytes = ntt4x30_cnv_accumulate_dft_dual_tmp_bytes(res_ref.size(), 0, 0);
+        let (tmp, _) = take_host_typed::<BE, u8>(scratch.borrow(), bytes);
+        ntt4x30_cnv_accumulate_dft_dual::<BE>(module, cnv_offset, &mut res_ref, res_col_0, terms_0, res_col_1, terms_1, tmp);
     }
 
     fn cnv_pairwise_apply_dft_tmp_bytes_default(

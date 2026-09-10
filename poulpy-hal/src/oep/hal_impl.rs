@@ -1075,6 +1075,60 @@ pub unsafe trait HalVmpImpl<BE: Backend>: Backend {
         scratch: &mut ScratchArena<'_, BE>,
     );
 
+    #[allow(clippy::too_many_arguments)]
+    fn vmp_apply_dft_to_dft_dual_tmp_bytes(
+        module: &Module<BE>,
+        res_size: usize,
+        a_size: usize,
+        b_rows: usize,
+        b_cols_in: usize,
+        b_cols_out: usize,
+        b_size: usize,
+    ) -> usize {
+        Self::vmp_apply_dft_to_dft_tmp_bytes(module, res_size, a_size, b_rows, b_cols_in, b_cols_out, b_size)
+    }
+
+    fn vmp_apply_dft_to_dft_dual(
+        module: &Module<BE>,
+        res0: &mut crate::layouts::VecZnxDftBackendMut<'_, BE>,
+        res1: &mut crate::layouts::VecZnxDftBackendMut<'_, BE>,
+        a0: &crate::layouts::VecZnxDftBackendRef<'_, BE>,
+        a1: &crate::layouts::VecZnxDftBackendRef<'_, BE>,
+        b: &crate::layouts::VmpPMatBackendRef<'_, BE>,
+        limb_offset: usize,
+        scratch: &mut ScratchArena<'_, BE>,
+    ) {
+        Self::vmp_apply_dft_to_dft(module, res0, a0, b, limb_offset, &mut scratch.borrow());
+        Self::vmp_apply_dft_to_dft(module, res1, a1, b, limb_offset, &mut scratch.borrow());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn vmp_apply_dft_to_dft_dual_accumulate_tmp_bytes(
+        module: &Module<BE>,
+        res_size: usize,
+        a_size: usize,
+        b_rows: usize,
+        b_cols_in: usize,
+        b_cols_out: usize,
+        b_size: usize,
+    ) -> usize {
+        Self::vmp_apply_dft_to_dft_accumulate_tmp_bytes(module, res_size, a_size, b_rows, b_cols_in, b_cols_out, b_size)
+    }
+
+    fn vmp_apply_dft_to_dft_dual_accumulate(
+        module: &Module<BE>,
+        res0: &mut crate::layouts::VecZnxDftBackendMut<'_, BE>,
+        res1: &mut crate::layouts::VecZnxDftBackendMut<'_, BE>,
+        a0: &crate::layouts::VecZnxDftBackendRef<'_, BE>,
+        a1: &crate::layouts::VecZnxDftBackendRef<'_, BE>,
+        b: &crate::layouts::VmpPMatBackendRef<'_, BE>,
+        limb_offset: usize,
+        scratch: &mut ScratchArena<'_, BE>,
+    ) {
+        Self::vmp_apply_dft_to_dft_accumulate(module, res0, a0, b, limb_offset, &mut scratch.borrow());
+        Self::vmp_apply_dft_to_dft_accumulate(module, res1, a1, b, limb_offset, &mut scratch.borrow());
+    }
+
     fn vmp_extract_selected_rows(
         module: &Module<BE>,
         res: &mut crate::layouts::VmpPMatBackendMut<'_, BE>,

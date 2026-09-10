@@ -368,6 +368,14 @@ pub fn ntt4x30_cnv_accumulate_dft_tmp_bytes(res_size: usize, _a_size: usize, _b_
     8 * CNV_ACC_GROUP * res_size * size_of::<u64>()
 }
 
+/// Scratch bytes required by [`ntt4x30_cnv_accumulate_dft_dual`].
+///
+/// The fused dual-output path keeps one staged output group for each result
+/// column so both sums can stay live while a shared left operand is visited.
+pub fn ntt4x30_cnv_accumulate_dft_dual_tmp_bytes(res_size: usize, _a_size: usize, _b_size: usize) -> usize {
+    2 * ntt4x30_cnv_accumulate_dft_tmp_bytes(res_size, 0, 0)
+}
+
 /// One window contribution of one term to one output limb: `len` row pairs
 /// starting at `a_row` (canonical left rows, ascending) and `b_row` (reversed
 /// q120c rows, ascending).
@@ -500,6 +508,160 @@ pub fn ntt4x30_cnv_accumulate_dft<BE>(
                 let res_u64: &mut [u64] = cast_slice_mut(res.at_mut(res_col, k));
                 res_u64[8 * grp_base..8 * (grp_base + in_group)]
                     .copy_from_slice(&stage[8 * k * CNV_ACC_GROUP..8 * (k * CNV_ACC_GROUP + in_group)]);
+            }
+        }
+    }
+}
+
+/// Fused two-output convolution accumulation with a shared prepared left operand.
+///
+/// Computes
+///
+/// `res[res_col_0] = Σ_t a_t ⊛ b0_t`
+///
+/// and
+///
+/// `res[res_col_1] = Σ_t a_t ⊛ b1_t`.
+///
+/// The fast path requires the two term sets to have the same length and each
+/// corresponding pair to reference the same prepared left operand/column with
+/// identical operand sizes.  This is exactly the complex-SHIP masking layout:
+/// the encrypted selector mask is shared while the prepared plaintext operand
+/// is permuted between the two outputs.  If that invariant does not hold, the
+/// routine falls back to two ordinary fused accumulations.
+#[allow(clippy::too_many_arguments)]
+pub fn ntt4x30_cnv_accumulate_dft_dual<BE>(
+    module: &impl NttModuleHandle,
+    cnv_offset: usize,
+    res: &mut VecZnxDftBackendMut<'_, BE>,
+    res_col_0: usize,
+    terms_0: &[crate::layouts::CnvDftAccTerm<'_, BE>],
+    res_col_1: usize,
+    terms_1: &[crate::layouts::CnvDftAccTerm<'_, BE>],
+    tmp: &mut [u8],
+) where
+    BE: Backend<DftWord = Q120bScalar, ZnxWord = i64>,
+    for<'x> <BE as Backend>::BufRef<'x>: HostDataRef,
+    for<'x> <BE as Backend>::BufMut<'x>: crate::layouts::HostDataMut,
+{
+    use crate::reference::ntt4x30::mat_vec::{accum_mul_q120_bc, accum_to_q120b};
+
+    debug_assert_ne!(res_col_0, res_col_1);
+
+    let n = res.n();
+    let res_size = res.size();
+    if res_size == 0 {
+        return;
+    }
+
+    // The dual API is generic, but the optimized kernel specifically exploits
+    // a common LHS.  Preserve generic semantics by falling back whenever the
+    // two term lists cannot be paired one-to-one on the same prepared mask.
+    let shared_lhs = terms_0.len() == terms_1.len()
+        && terms_0.iter().zip(terms_1).all(|(t0, t1)| {
+            t0.a_col == t1.a_col
+                && t0.a.size() == t1.a.size()
+                && t0.b.size() == t1.b.size()
+                && t0.a.raw().as_ptr() == t1.a.raw().as_ptr()
+        });
+
+    if !shared_lhs || terms_0.is_empty() {
+        ntt4x30_cnv_accumulate_dft::<BE>(module, cnv_offset, res, res_col_0, terms_0, tmp);
+        ntt4x30_cnv_accumulate_dft::<BE>(module, cnv_offset, res, res_col_1, terms_1, tmp);
+        return;
+    }
+
+    let meta = module.get_bbc_meta();
+    let n_blks = n / 2;
+
+    // Each entry holds one shared left column and the two right columns that
+    // feed the real/imag (or output-0/output-1) accumulators.
+    let term_cols: Vec<(&[u32], &[u32], &[u32], usize, usize)> = terms_0
+        .iter()
+        .zip(terms_1)
+        .map(|(t0, t1)| {
+            let a_size = t0.a.size();
+            let b_size = t0.b.size();
+            (
+                col_slice_u32(t0.a.raw(), n, a_size, t0.a_col),
+                col_slice_u32(t0.b.raw(), n, b_size, t0.b_col),
+                col_slice_u32(t1.b.raw(), n, b_size, t1.b_col),
+                a_size,
+                b_size,
+            )
+        })
+        .collect();
+
+    let sched = cnv_accumulate_schedule(
+        cnv_offset,
+        res_size,
+        &term_cols.iter().map(|&(_, _, _, a, b)| (a, b)).collect::<Vec<_>>(),
+    );
+
+    let (prefix, tmp_u64, suffix) = unsafe { tmp.align_to_mut::<u64>() };
+    debug_assert!(prefix.is_empty());
+    debug_assert!(suffix.is_empty());
+    let stage_words = 8 * CNV_ACC_GROUP * res_size;
+    debug_assert!(tmp_u64.len() >= 2 * stage_words);
+    let (stage_0, rest) = tmp_u64.split_at_mut(stage_words);
+    let stage_1 = &mut rest[..stage_words];
+
+    for blk in 0..n_blks {
+        let grp_pos = blk % CNV_ACC_GROUP;
+
+        for (k, sched_k) in sched.iter().enumerate() {
+            let mut s_0 = [[0u64; 8]; 2];
+            let mut s_1 = [[0u64; 8]; 2];
+
+            for e in sched_k {
+                let (a_col, b0_col, b1_col, a_size, b_size) = term_cols[e.term];
+                let a_blk = &a_col[blk * 16 * a_size..];
+                let b0_blk = &b0_col[blk * 16 * b_size..];
+                let b1_blk = &b1_col[blk * 16 * b_size..];
+
+                for i in 0..e.len {
+                    // Fetch the shared prepared mask row once at the source
+                    // level, then feed it to both independent q120 accumulators.
+                    let x = &a_blk[16 * (e.a_row + i)..16 * (e.a_row + i) + 16];
+                    let y0 = &b0_blk[16 * (e.b_row + i)..16 * (e.b_row + i) + 16];
+                    let y1 = &b1_blk[16 * (e.b_row + i)..16 * (e.b_row + i) + 16];
+
+                    let x_lo: &[u32; 8] = x[..8].try_into().unwrap();
+                    let x_hi: &[u32; 8] = x[8..].try_into().unwrap();
+                    let y0_lo: &[u32; 8] = y0[..8].try_into().unwrap();
+                    let y0_hi: &[u32; 8] = y0[8..].try_into().unwrap();
+                    let y1_lo: &[u32; 8] = y1[..8].try_into().unwrap();
+                    let y1_hi: &[u32; 8] = y1[8..].try_into().unwrap();
+
+                    accum_mul_q120_bc(&mut s_0[0], x_lo, y0_lo);
+                    accum_mul_q120_bc(&mut s_0[1], x_hi, y0_hi);
+                    accum_mul_q120_bc(&mut s_1[0], x_lo, y1_lo);
+                    accum_mul_q120_bc(&mut s_1[1], x_hi, y1_hi);
+                }
+            }
+
+            let off = 8 * (k * CNV_ACC_GROUP + grp_pos);
+            let out_0 = &mut stage_0[off..];
+            let out_1 = &mut stage_1[off..];
+            accum_to_q120b::<Primes30>((&mut out_0[..4]).try_into().unwrap(), &s_0[0], meta);
+            accum_to_q120b::<Primes30>((&mut out_0[4..8]).try_into().unwrap(), &s_0[1], meta);
+            accum_to_q120b::<Primes30>((&mut out_1[..4]).try_into().unwrap(), &s_1[0], meta);
+            accum_to_q120b::<Primes30>((&mut out_1[4..8]).try_into().unwrap(), &s_1[1], meta);
+        }
+
+        // Flush both staged outputs over the same block group.
+        let in_group = grp_pos + 1;
+        if in_group == CNV_ACC_GROUP || blk == n_blks - 1 {
+            let grp_base = blk + 1 - in_group;
+            for k in 0..res_size {
+                let run_lo = 8 * k * CNV_ACC_GROUP;
+                let run_hi = 8 * (k * CNV_ACC_GROUP + in_group);
+
+                let res0_u64: &mut [u64] = cast_slice_mut(res.at_mut(res_col_0, k));
+                res0_u64[8 * grp_base..8 * (grp_base + in_group)].copy_from_slice(&stage_0[run_lo..run_hi]);
+
+                let res1_u64: &mut [u64] = cast_slice_mut(res.at_mut(res_col_1, k));
+                res1_u64[8 * grp_base..8 * (grp_base + in_group)].copy_from_slice(&stage_1[run_lo..run_hi]);
             }
         }
     }

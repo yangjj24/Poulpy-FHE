@@ -19,7 +19,7 @@ use poulpy_hal::{
 use super::{
     // masking::ship_masking_accumulate,
     masking::{ship_masking_accumulate, ship_masking_accumulate_dual},
-    mux::{ship_mux_plans, ship_mux_rotate},
+    mux::{ship_mux_plans, ship_mux_rotate, ship_mux_rotate_dual},
 };
 use crate::{
     CKKSCtBounds, CKKSInfos, CKKSMeta, SetCKKSInfos, SlotsKind,
@@ -243,14 +243,10 @@ where
 
             ship_masking_accumulate_dual(module, &mut acc_real, &mut acc_imag, &plan, ik.masks(), pi, scratch)?;
 
-            // H-MUX is still executed independently for now.
-            //
-            // Both paths already share the same HMuxRotKey material;
-            // a later optimization can fuse these two evaluations.
+            // The two complex coefficient halves use the same H-MUX key group.
+            // Traverse each prepared key once and evaluate both products together.
             for group in ik.mux_keys() {
-                ship_mux_rotate(module, &mut acc_real, group, &plans, scratch)?;
-
-                ship_mux_rotate(module, &mut acc_imag, group, &plans, scratch)?;
+                ship_mux_rotate_dual(module, &mut acc_real, &mut acc_imag, group, &plans, scratch)?;
             }
 
             leaves[0].push(acc_real);

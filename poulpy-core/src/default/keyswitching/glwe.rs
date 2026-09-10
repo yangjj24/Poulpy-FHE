@@ -2,7 +2,8 @@ use crate::api::GLWEBytesOf;
 use poulpy_hal::{
     api::{
         ModuleN, ScratchArenaTakeBasic, VecZnxDftApply, VecZnxDftBytesOf, VecZnxDftCopy, VmpApplyDftToDft,
-        VmpApplyDftToDftAccumulate, VmpApplyDftToDftAccumulateTmpBytes, VmpApplyDftToDftTmpBytes, VmpExtractSelectedRows,
+        VmpApplyDftToDftAccumulate, VmpApplyDftToDftAccumulateTmpBytes, VmpApplyDftToDftDual, VmpApplyDftToDftDualAccumulate,
+        VmpApplyDftToDftDualAccumulateTmpBytes, VmpApplyDftToDftDualTmpBytes, VmpApplyDftToDftTmpBytes, VmpExtractSelectedRows,
         VmpPMatBytesOf,
     },
     layouts::{
@@ -80,6 +81,10 @@ where
         + VmpApplyDftToDftAccumulateTmpBytes
         + VmpApplyDftToDft<BE>
         + VmpApplyDftToDftAccumulate<BE>
+        + VmpApplyDftToDftDualTmpBytes
+        + VmpApplyDftToDftDualAccumulateTmpBytes
+        + VmpApplyDftToDftDual<BE>
+        + VmpApplyDftToDftDualAccumulate<BE>
         + VecZnxDftCopy<BE>
         + VmpExtractSelectedRows<BE>
         + VmpPMatBytesOf,
@@ -147,6 +152,80 @@ where
             );
         });
     }
+
+    fn gglwe_product_dft_dual_tmp_bytes_default<K>(&self, res_size: usize, a_size: usize, key_infos: &K) -> usize
+    where
+        K: GGLWEInfos,
+    {
+        let dsize: usize = key_infos.dsize().into();
+        let dnum: usize = key_infos.dnum().into();
+        let cols_in: usize = key_infos.rank_in().into();
+        let cols_out: usize = (key_infos.rank_out() + 1).into();
+        let key_size: usize = key_infos.size();
+        let product = if dsize == 1 {
+            self.vmp_apply_dft_to_dft_dual_tmp_bytes(res_size, a_size, dnum, cols_in, cols_out, key_size)
+        } else {
+            gglwe_product_digits_strided_dual_tmp_bytes_default(
+                self, res_size, cols_in, a_size, dsize, dnum, cols_in, cols_out, key_size,
+            )
+        };
+        if key_infos.stride() == 1 {
+            product
+        } else {
+            self.bytes_of_vmp_pmat(dnum, cols_in, cols_out, key_size) + product
+        }
+    }
+
+    fn gglwe_product_dft_dual_default<'r0, 'r1, 'a0, 'a1>(
+        &self,
+        res0: &mut VecZnxDftBackendMut<'r0, BE>,
+        res1: &mut VecZnxDftBackendMut<'r1, BE>,
+        a0: &VecZnxDftBackendRef<'a0, BE>,
+        a1: &VecZnxDftBackendRef<'a1, BE>,
+        key: &GGLWEPreparedBackendRef<'_, BE>,
+        term_count: usize,
+        scratch: &mut ScratchArena<'_, BE>,
+    ) {
+        assert_eq!(res0.size(), res1.size(), "dual GGLWE outputs must have the same size");
+        assert_eq!(res0.cols(), res1.cols(), "dual GGLWE outputs must have the same column count");
+        assert_eq!(a0.size(), a1.size(), "dual GGLWE inputs must have the same size");
+        assert_eq!(a0.cols(), a1.cols(), "dual GGLWE inputs must have the same column count");
+        let a_size = a0.size();
+        let needed = self.gglwe_product_dft_dual_tmp_bytes_default(res0.size(), a_size, key);
+        assert!(
+            scratch.available() >= needed,
+            "scratch.available(): {} < GGLWEProductDefault::gglwe_product_dft_dual_tmp_bytes: {}",
+            scratch.available(),
+            needed
+        );
+
+        let stride: usize = key.stride();
+        if stride == 1 {
+            gglwe_product_pmat_dual(self, res0, res1, a0, a1, key, &key.data, term_count, scratch);
+            return;
+        }
+        let (rows, cols_in, cols_out) = (
+            key.dnum().as_usize(),
+            key.rank_in().as_usize(),
+            (key.rank_out() + 1).as_usize(),
+        );
+        let key_size = key.size();
+        scratch.scope(|scratch_phase| {
+            let (mut dense, mut scratch_1) = scratch_phase.take_vmp_pmat_scratch(self, rows, cols_in, cols_out, key_size);
+            self.vmp_extract_selected_rows(&mut dense, &key.data, stride - 1, stride);
+            gglwe_product_pmat_dual(
+                self,
+                res0,
+                res1,
+                a0,
+                a1,
+                key,
+                &dense.to_backend_ref(),
+                term_count,
+                &mut scratch_1.borrow(),
+            );
+        });
+    }
 }
 
 /// One GGLWE product against an already dense matrix, with the key's own
@@ -181,6 +260,38 @@ fn gglwe_product_pmat<BE>(
     }
 }
 
+/// Dual GGLWE product against one dense prepared matrix. Arithmetic remains
+/// independent; the prepared-matrix traversal can be shared by the HAL.
+fn gglwe_product_pmat_dual<BE>(
+    module: &Module<BE>,
+    res0: &mut VecZnxDftBackendMut<'_, BE>,
+    res1: &mut VecZnxDftBackendMut<'_, BE>,
+    a0: &VecZnxDftBackendRef<'_, BE>,
+    a1: &VecZnxDftBackendRef<'_, BE>,
+    key: &GGLWEPreparedBackendRef<'_, BE>,
+    pmat: &VmpPMatBackendRef<'_, BE>,
+    term_count: usize,
+    scratch: &mut ScratchArena<'_, BE>,
+) where
+    BE: Backend + GGLWEProductDigitsStridedImpl<BE>,
+    Module<BE>: VecZnxDftBytesOf + VecZnxDftCopy<BE> + VmpApplyDftToDftDual<BE> + VmpApplyDftToDftDualAccumulate<BE>,
+{
+    let dsize: usize = key.dsize().into();
+    if dsize == 1 {
+        module.vmp_apply_dft_to_dft_dual(res0, res1, a0, a1, pmat, 0, scratch);
+    } else {
+        let product_terms = key
+            .n()
+            .as_usize()
+            .saturating_mul(key.dnum().as_usize())
+            .saturating_mul(dsize)
+            .saturating_mul(key.rank_in().as_usize().max(1))
+            .saturating_mul(term_count.max(1));
+        let product_limbs = gadget_product_limbs(key.base2k(), product_terms);
+        gglwe_product_digits_strided_dual_default(module, res0, res1, a0, a1, dsize, product_limbs, pmat, scratch);
+    }
+}
+
 /// Default DFT-domain gadget product used by key-switching and external products.
 ///
 /// Public so backend forwarders can name the bound. It centralizes the
@@ -194,6 +305,10 @@ where
         + VmpApplyDftToDftAccumulateTmpBytes
         + VmpApplyDftToDft<BE>
         + VmpApplyDftToDftAccumulate<BE>
+        + VmpApplyDftToDftDualTmpBytes
+        + VmpApplyDftToDftDualAccumulateTmpBytes
+        + VmpApplyDftToDftDual<BE>
+        + VmpApplyDftToDftDualAccumulate<BE>
         + VecZnxDftCopy<BE>
         + VmpExtractSelectedRows<BE>
         + VmpPMatBytesOf,
@@ -208,6 +323,22 @@ where
         &self,
         res: &mut VecZnxDftBackendMut<'r, BE>,
         a: &VecZnxDftBackendRef<'a, BE>,
+        key: &GGLWEPreparedBackendRef<'_, BE>,
+        term_count: usize,
+        scratch: &mut ScratchArena<'_, BE>,
+    );
+
+    fn gglwe_product_dft_dual_tmp_bytes_default<K>(&self, res_size: usize, a_size: usize, key_infos: &K) -> usize
+    where
+        K: GGLWEInfos;
+
+    /// Applies two independent GGLWE products against the same prepared key.
+    fn gglwe_product_dft_dual_default<'r0, 'r1, 'a0, 'a1>(
+        &self,
+        res0: &mut VecZnxDftBackendMut<'r0, BE>,
+        res1: &mut VecZnxDftBackendMut<'r1, BE>,
+        a0: &VecZnxDftBackendRef<'a0, BE>,
+        a1: &VecZnxDftBackendRef<'a1, BE>,
         key: &GGLWEPreparedBackendRef<'_, BE>,
         term_count: usize,
         scratch: &mut ScratchArena<'_, BE>,
@@ -237,6 +368,90 @@ where
     let accumulate =
         module.vmp_apply_dft_to_dft_accumulate_tmp_bytes(res_size, digit_size, pmat_rows, pmat_cols_in, pmat_cols_out, pmat_size);
     module.bytes_of_vec_znx_dft(a_cols, digit_size) + apply.max(accumulate)
+}
+
+/// Scratch bound for the dual interleaved-digit path. Two digit views must be
+/// live simultaneously so one VMP call can consume the shared prepared matrix.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn gglwe_product_digits_strided_dual_tmp_bytes_default<BE: Backend>(
+    module: &Module<BE>,
+    res_size: usize,
+    a_cols: usize,
+    a_size: usize,
+    dsize: usize,
+    pmat_rows: usize,
+    pmat_cols_in: usize,
+    pmat_cols_out: usize,
+    pmat_size: usize,
+) -> usize
+where
+    Module<BE>: VecZnxDftBytesOf + VmpApplyDftToDftDualTmpBytes + VmpApplyDftToDftDualAccumulateTmpBytes,
+{
+    assert_ne!(dsize, 0);
+    let digit_size = a_size.div_ceil(dsize).min(pmat_rows);
+    let apply =
+        module.vmp_apply_dft_to_dft_dual_tmp_bytes(res_size, digit_size, pmat_rows, pmat_cols_in, pmat_cols_out, pmat_size);
+    let accumulate = module.vmp_apply_dft_to_dft_dual_accumulate_tmp_bytes(
+        res_size,
+        digit_size,
+        pmat_rows,
+        pmat_cols_in,
+        pmat_cols_out,
+        pmat_size,
+    );
+    2 * module.bytes_of_vec_znx_dft(a_cols, digit_size) + apply.max(accumulate)
+}
+
+/// Dual canonical GGLWE product over interleaved gadget digits. The two digit
+/// vectors are gathered together and applied to the same prepared matrix.
+#[doc(hidden)]
+pub fn gglwe_product_digits_strided_dual_default<BE: Backend>(
+    module: &Module<BE>,
+    res0: &mut VecZnxDftBackendMut<'_, BE>,
+    res1: &mut VecZnxDftBackendMut<'_, BE>,
+    a0: &VecZnxDftBackendRef<'_, BE>,
+    a1: &VecZnxDftBackendRef<'_, BE>,
+    dsize: usize,
+    product_limbs: usize,
+    pmat: &poulpy_hal::layouts::VmpPMatBackendRef<'_, BE>,
+    scratch: &mut ScratchArena<'_, BE>,
+) where
+    Module<BE>: VecZnxDftBytesOf + VecZnxDftCopy<BE> + VmpApplyDftToDftDual<BE> + VmpApplyDftToDftDualAccumulate<BE>,
+{
+    assert_ne!(dsize, 0);
+    assert_eq!(a0.cols(), a1.cols());
+    assert_eq!(a0.size(), a1.size());
+    let cols = a0.cols();
+    let a_size = a0.size();
+    let dnum = pmat.rows();
+    for di in 0..dsize {
+        let digit_size = ((a_size + di) / dsize).min(dnum);
+        let (mut digit0, scratch_1) = scratch.borrow().take_vec_znx_dft_scratch(module, cols, digit_size);
+        let (mut digit1, mut digit_scratch) = scratch_1.take_vec_znx_dft_scratch(module, cols, digit_size);
+        for col in 0..cols {
+            module.vec_znx_dft_copy(dsize, dsize - di - 1, &mut digit0, col, a0, col);
+            module.vec_znx_dft_copy(dsize, dsize - di - 1, &mut digit1, col, a1, col);
+        }
+        let digit0_ref = digit0.to_backend_ref();
+        let digit1_ref = digit1.to_backend_ref();
+        if di == 0 {
+            module.vmp_apply_dft_to_dft_dual(res0, res1, &digit0_ref, &digit1_ref, pmat, 0, &mut digit_scratch);
+        } else {
+            let compute_size = gglwe_product_digit_output_size(res0.size(), pmat.size(), dsize, di, product_limbs);
+            let mut res0_view = res0.with_size_mut(compute_size);
+            let mut res1_view = res1.with_size_mut(compute_size);
+            module.vmp_apply_dft_to_dft_dual_accumulate(
+                &mut res0_view,
+                &mut res1_view,
+                &digit0_ref,
+                &digit1_ref,
+                pmat,
+                di,
+                &mut digit_scratch,
+            );
+        }
+    }
 }
 
 /// Canonical GGLWE product over interleaved gadget digits: digit `di` gathers

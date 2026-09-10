@@ -137,6 +137,13 @@ pub fn ntt4x30_vmp_apply_dft_to_dft_tmp_bytes(a_size: usize, b_rows: usize, b_co
     (16 + 8 * row_max) * size_of::<u64>()
 }
 
+/// Scratch space for the dual apply path. Two input x2-block vectors are
+/// extracted simultaneously while the matrix block is kept hot/shared.
+pub fn ntt4x30_vmp_apply_dft_to_dft_dual_tmp_bytes(a_size: usize, b_rows: usize, b_cols_in: usize) -> usize {
+    let row_max = a_size.min(b_rows) * b_cols_in;
+    (16 + 16 * row_max) * size_of::<u64>()
+}
+
 /// Save an x2-block (8 u64) into a q120b vector (overwrite mode).
 #[inline(always)]
 fn save_blk_overwrite(n: usize, blk: usize, dst: &mut [u64], src: &[u64]) {
@@ -302,6 +309,136 @@ fn vmp_apply_dft_to_dft_core<const OVERWRITE: bool, BE>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn vmp_apply_dft_to_dft_dual_core<BE>(
+    n: usize,
+    res0_u64: &mut [u64],
+    res1_u64: &mut [u64],
+    a0_u64: &[u64],
+    a1_u64: &[u64],
+    pmat_u32: &[u32],
+    limb_offset: usize,
+    nrows: usize,
+    ncols: usize,
+    meta: &BbcMeta<Primes30>,
+    tmp: &mut [u64],
+) where
+    BE: NttExtract1BlkContiguous + NttMulBbc1ColX2 + NttMulBbc2ColsX2,
+{
+    debug_assert!(n >= 2);
+    debug_assert!(n.is_power_of_two());
+    debug_assert_eq!(res0_u64.len(), res1_u64.len());
+    debug_assert_eq!(a0_u64.len(), a1_u64.len());
+
+    let n_blks = n / 2;
+    let a_size = a0_u64.len() / (4 * n);
+    let res_size = res0_u64.len() / (4 * n);
+    let row_end = nrows.min(a_size);
+
+    // Skip only rows that are zero in BOTH inputs. This preserves one common
+    // prepared-matrix row window, which is required for the shared traversal.
+    let row_start = (0..row_end)
+        .take_while(|&r| {
+            let lo = r * 4 * n;
+            let hi = lo + 4 * n;
+            a0_u64[lo..hi].iter().all(|&x| x == 0) && a1_u64[lo..hi].iter().all(|&x| x == 0)
+        })
+        .count();
+    let row_max = row_end - row_start;
+    let col_max = ncols.min(res_size + limb_offset);
+
+    if limb_offset >= col_max || row_max == 0 {
+        res0_u64.fill(0);
+        res1_u64.fill(0);
+        return;
+    }
+
+    let (mat2cols_output, rest) = tmp.split_at_mut(16);
+    let (extracted0, extracted1) = rest.split_at_mut(8 * row_max);
+    let offset = nrows * ncols * 16;
+    let a0_u64 = &a0_u64[row_start * 4 * n..];
+    let a1_u64 = &a1_u64[row_start * 4 * n..];
+
+    for blk_j in 0..n_blks {
+        let mat_blk_u32 = &pmat_u32[blk_j * offset..];
+
+        BE::ntt_extract_1blk_contiguous(n, row_max, blk_j, extracted0, a0_u64);
+        BE::ntt_extract_1blk_contiguous(n, row_max, blk_j, extracted1, a1_u64);
+        let extracted0_u32: &[u32] = cast_slice(extracted0);
+        let extracted1_u32: &[u32] = cast_slice(extracted1);
+
+        if limb_offset.is_multiple_of(2) {
+            for (col_res, col_pmat) in (0..).step_by(2).zip((limb_offset..col_max - 1).step_by(2)) {
+                let col_offset = col_pmat * (nrows * 16) + row_start * 32;
+                let mat = &mat_blk_u32[col_offset..];
+
+                BE::ntt_mul_bbc_2cols_x2(meta, row_max, mat2cols_output, extracted0_u32, mat);
+                let base0 = col_res * 4 * n;
+                let base1 = (col_res + 1) * 4 * n;
+                save_blk_overwrite(n, blk_j, &mut res0_u64[base0..], &mat2cols_output[0..8]);
+                save_blk_overwrite(n, blk_j, &mut res0_u64[base1..], &mat2cols_output[8..16]);
+
+                BE::ntt_mul_bbc_2cols_x2(meta, row_max, mat2cols_output, extracted1_u32, mat);
+                save_blk_overwrite(n, blk_j, &mut res1_u64[base0..], &mat2cols_output[0..8]);
+                save_blk_overwrite(n, blk_j, &mut res1_u64[base1..], &mat2cols_output[8..16]);
+            }
+        } else {
+            let col_offset = (limb_offset - 1) * (nrows * 16) + row_start * 32;
+            let mat = &mat_blk_u32[col_offset..];
+
+            BE::ntt_mul_bbc_2cols_x2(meta, row_max, mat2cols_output, extracted0_u32, mat);
+            save_blk_overwrite(n, blk_j, &mut res0_u64[0..], &mat2cols_output[8..16]);
+            BE::ntt_mul_bbc_2cols_x2(meta, row_max, mat2cols_output, extracted1_u32, mat);
+            save_blk_overwrite(n, blk_j, &mut res1_u64[0..], &mat2cols_output[8..16]);
+
+            for (col_res, col_pmat) in (1..).step_by(2).zip((limb_offset + 1..col_max - 1).step_by(2)) {
+                let col_offset = col_pmat * (nrows * 16) + row_start * 32;
+                let mat = &mat_blk_u32[col_offset..];
+                let base0 = col_res * 4 * n;
+                let base1 = (col_res + 1) * 4 * n;
+
+                BE::ntt_mul_bbc_2cols_x2(meta, row_max, mat2cols_output, extracted0_u32, mat);
+                save_blk_overwrite(n, blk_j, &mut res0_u64[base0..], &mat2cols_output[0..8]);
+                save_blk_overwrite(n, blk_j, &mut res0_u64[base1..], &mat2cols_output[8..16]);
+                BE::ntt_mul_bbc_2cols_x2(meta, row_max, mat2cols_output, extracted1_u32, mat);
+                save_blk_overwrite(n, blk_j, &mut res1_u64[base0..], &mat2cols_output[0..8]);
+                save_blk_overwrite(n, blk_j, &mut res1_u64[base1..], &mat2cols_output[8..16]);
+            }
+        }
+
+        if !col_max.is_multiple_of(2) {
+            let last_col = col_max - 1;
+            if last_col >= limb_offset {
+                let row_offset = if ncols == col_max { row_start * 16 } else { row_start * 32 };
+                let col_offset = last_col * (nrows * 16) + row_offset;
+                let mat = &mat_blk_u32[col_offset..];
+                let col_res = last_col - limb_offset;
+                let base = col_res * 4 * n;
+
+                if ncols == col_max {
+                    BE::ntt_mul_bbc_1col_x2(meta, row_max, &mut mat2cols_output[0..8], extracted0_u32, mat);
+                } else {
+                    BE::ntt_mul_bbc_2cols_x2(meta, row_max, mat2cols_output, extracted0_u32, mat);
+                }
+                save_blk_overwrite(n, blk_j, &mut res0_u64[base..], &mat2cols_output[0..8]);
+
+                if ncols == col_max {
+                    BE::ntt_mul_bbc_1col_x2(meta, row_max, &mut mat2cols_output[0..8], extracted1_u32, mat);
+                } else {
+                    BE::ntt_mul_bbc_2cols_x2(meta, row_max, mat2cols_output, extracted1_u32, mat);
+                }
+                save_blk_overwrite(n, blk_j, &mut res1_u64[base..], &mat2cols_output[0..8]);
+            }
+        }
+    }
+
+    let active_cols = col_max - limb_offset;
+    for col in active_cols..res_size {
+        res0_u64[col * 4 * n..(col + 1) * 4 * n].fill(0);
+        res1_u64[col * 4 * n..(col + 1) * 4 * n].fill(0);
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Public apply functions
 // ──────────────────────────────────────────────────────────────────────────────
@@ -341,6 +478,58 @@ pub fn ntt4x30_vmp_apply_dft_to_dft<BE>(
         n,
         res_u64,
         a_u64,
+        pmat_u32,
+        limb_offset * pmat.cols_out(),
+        nrows,
+        ncols,
+        meta,
+        tmp,
+    );
+}
+
+/// Dual NTT-domain VMP against one prepared matrix. The matrix block/column
+/// traversal is shared and each matrix slice is consumed by the two inputs
+/// back-to-back, keeping key material resident across the pair.
+pub fn ntt4x30_vmp_apply_dft_to_dft_dual<BE>(
+    module: &impl NttModuleHandle,
+    res0: &mut VecZnxDftBackendMut<'_, BE>,
+    res1: &mut VecZnxDftBackendMut<'_, BE>,
+    a0: &VecZnxDftBackendRef<'_, BE>,
+    a1: &VecZnxDftBackendRef<'_, BE>,
+    pmat: &VmpPMatBackendRef<'_, BE>,
+    limb_offset: usize,
+    tmp: &mut [u64],
+) where
+    BE: Backend<DftWord = Q120bScalar, ZnxWord = i64> + NttExtract1BlkContiguous + NttMulBbc1ColX2 + NttMulBbc2ColsX2,
+    for<'x> <BE as Backend>::BufMut<'x>: HostDataMut,
+    for<'x> <BE as Backend>::BufRef<'x>: HostDataRef,
+{
+    debug_assert_eq!(res0.n(), pmat.n());
+    debug_assert_eq!(res1.n(), pmat.n());
+    debug_assert_eq!(a0.n(), pmat.n());
+    debug_assert_eq!(a1.n(), pmat.n());
+    debug_assert_eq!(res0.size(), res1.size());
+    debug_assert_eq!(res0.cols(), res1.cols());
+    debug_assert_eq!(a0.size(), a1.size());
+    debug_assert_eq!(a0.cols(), a1.cols());
+
+    let n = res0.n();
+    let nrows = pmat.cols_in() * pmat.rows();
+    let ncols = pmat.cols_out() * pmat.size();
+    let meta = module.get_bbc_meta();
+
+    let res0_u64: &mut [u64] = cast_slice_mut(res0.raw_mut());
+    let res1_u64: &mut [u64] = cast_slice_mut(res1.raw_mut());
+    let a0_u64: &[u64] = cast_slice(a0.raw());
+    let a1_u64: &[u64] = cast_slice(a1.raw());
+    let pmat_u32: &[u32] = cast_slice(pmat.raw());
+
+    vmp_apply_dft_to_dft_dual_core::<BE>(
+        n,
+        res0_u64,
+        res1_u64,
+        a0_u64,
+        a1_u64,
         pmat_u32,
         limb_offset * pmat.cols_out(),
         nrows,

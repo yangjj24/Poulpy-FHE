@@ -125,6 +125,64 @@ pub trait VmpApplyDftToDftAccumulate<B: Backend> {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+/// Scratch bytes for [`VmpApplyDftToDftDual`]. Both products have the same
+/// logical shape and share the prepared matrix.
+pub trait VmpApplyDftToDftDualTmpBytes {
+    fn vmp_apply_dft_to_dft_dual_tmp_bytes(
+        &self,
+        res_size: usize,
+        a_size: usize,
+        b_rows: usize,
+        b_cols_in: usize,
+        b_cols_out: usize,
+        b_size: usize,
+    ) -> usize;
+}
+
+/// Applies two independent DFT-domain vector-matrix products against the same
+/// prepared matrix. Backends may fuse the traversal of `pmat`.
+pub trait VmpApplyDftToDftDual<B: Backend> {
+    fn vmp_apply_dft_to_dft_dual(
+        &self,
+        res0: &mut VecZnxDftBackendMut<'_, B>,
+        res1: &mut VecZnxDftBackendMut<'_, B>,
+        a0: &VecZnxDftBackendRef<'_, B>,
+        a1: &VecZnxDftBackendRef<'_, B>,
+        pmat: &VmpPMatBackendRef<'_, B>,
+        limb_offset: usize,
+        scratch: &mut ScratchArena<'_, B>,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Scratch bytes for [`VmpApplyDftToDftDualAccumulate`].
+pub trait VmpApplyDftToDftDualAccumulateTmpBytes {
+    fn vmp_apply_dft_to_dft_dual_accumulate_tmp_bytes(
+        &self,
+        res_size: usize,
+        a_size: usize,
+        b_rows: usize,
+        b_cols_in: usize,
+        b_cols_out: usize,
+        b_size: usize,
+    ) -> usize;
+}
+
+/// Fused pair of `res += a · pmat` operations against one prepared matrix.
+pub trait VmpApplyDftToDftDualAccumulate<B: Backend> {
+    fn vmp_apply_dft_to_dft_dual_accumulate(
+        &self,
+        res0: &mut VecZnxDftBackendMut<'_, B>,
+        res1: &mut VecZnxDftBackendMut<'_, B>,
+        a0: &VecZnxDftBackendRef<'_, B>,
+        a1: &VecZnxDftBackendRef<'_, B>,
+        pmat: &VmpPMatBackendRef<'_, B>,
+        limb_offset: usize,
+        scratch: &mut ScratchArena<'_, B>,
+    );
+}
+
 /// Copies selected rows and the leading limbs of a
 /// [`VmpPMat`](crate::layouts::VmpPMat) into a smaller one.
 ///
