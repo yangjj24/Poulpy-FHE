@@ -27,6 +27,15 @@ pub unsafe trait CKKSMulImpl<BE: Backend>: Backend {
         b: &B,
         tsk: &T,
     ) -> usize;
+    fn ckks_mul_dual_tmp_bytes_impl<R: GLWEInfos, A: GLWEInfos, B: GLWEInfos, T: GGLWEInfos>(
+        module: &Module<BE>,
+        res: &R,
+        a: &A,
+        b: &B,
+        tsk: &T,
+    ) -> usize {
+        Self::ckks_mul_tmp_bytes_impl(module, res, a, b, tsk)
+    }
     fn ckks_square_tmp_bytes_impl<R: GLWEInfos, A: GLWEInfos, T: GGLWEInfos>(
         module: &Module<BE>,
         res: &R,
@@ -58,6 +67,27 @@ pub unsafe trait CKKSMulImpl<BE: Backend>: Backend {
         A: GLWEToBackendRef<BE> + CKKSInfos + GLWEInfos,
         B: GLWEToBackendRef<BE> + CKKSInfos + GLWEInfos,
         T: GetTensorKey<BE>;
+    #[allow(clippy::too_many_arguments)]
+    fn ckks_mul_into_dual_impl<Dst, A, B, T>(
+        module: &Module<BE>,
+        dst0: &mut Dst,
+        a0: &A,
+        b0: &B,
+        dst1: &mut Dst,
+        a1: &A,
+        b1: &B,
+        tsk: &T,
+        scratch: &mut ScratchArena<'_, BE>,
+    ) -> Result<()>
+    where
+        Dst: GLWEToBackendMut<BE> + CKKSInfos + SetCKKSInfos + GLWEInfos,
+        A: GLWEToBackendRef<BE> + CKKSInfos + GLWEInfos,
+        B: GLWEToBackendRef<BE> + CKKSInfos + GLWEInfos,
+        T: GetTensorKey<BE>,
+    {
+        Self::ckks_mul_into_impl(module, dst0, a0, b0, tsk, &mut scratch.borrow())?;
+        Self::ckks_mul_into_impl(module, dst1, a1, b1, tsk, &mut scratch.borrow())
+    }
     fn ckks_mul_assign_impl<Dst, A, T>(
         module: &Module<BE>,
         dst: &mut Dst,
@@ -175,6 +205,16 @@ where
         module.ckks_mul_tmp_bytes_default(res, a, b, tsk)
     }
 
+    fn ckks_mul_dual_tmp_bytes_impl<R: GLWEInfos, A: GLWEInfos, B: GLWEInfos, T: GGLWEInfos>(
+        module: &Module<BE>,
+        res: &R,
+        a: &A,
+        b: &B,
+        tsk: &T,
+    ) -> usize {
+        module.ckks_mul_dual_tmp_bytes_default(res, a, b, tsk)
+    }
+
     fn ckks_square_tmp_bytes_impl<R: GLWEInfos, A: GLWEInfos, T: GGLWEInfos>(
         module: &Module<BE>,
         res: &R,
@@ -217,6 +257,26 @@ where
         T: GetTensorKey<BE>,
     {
         module.ckks_mul_into_default(dst, a, b, tsk, scratch)
+    }
+
+    fn ckks_mul_into_dual_impl<Dst, A, B, T>(
+        module: &Module<BE>,
+        dst0: &mut Dst,
+        a0: &A,
+        b0: &B,
+        dst1: &mut Dst,
+        a1: &A,
+        b1: &B,
+        tsk: &T,
+        scratch: &mut ScratchArena<'_, BE>,
+    ) -> Result<()>
+    where
+        Dst: GLWEToBackendMut<BE> + CKKSInfos + SetCKKSInfos + GLWEInfos,
+        A: GLWEToBackendRef<BE> + CKKSInfos + GLWEInfos,
+        B: GLWEToBackendRef<BE> + CKKSInfos + GLWEInfos,
+        T: GetTensorKey<BE>,
+    {
+        module.ckks_mul_into_dual_default(dst0, a0, b0, dst1, a1, b1, tsk, scratch)
     }
 
     fn ckks_mul_assign_impl<Dst, A, T>(

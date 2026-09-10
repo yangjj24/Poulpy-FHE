@@ -10,7 +10,8 @@ use crate::{
     api::{
         ModuleNew, ScratchOwnedAlloc, VecZnxBigAlloc, VecZnxBigNormalize, VecZnxBigNormalizeTmpBytes, VecZnxDftAddAssign,
         VecZnxDftAlloc, VecZnxDftApply, VecZnxDftZero, VecZnxIdftApplyTmpA, VmpApplyDft, VmpApplyDftTmpBytes, VmpApplyDftToDft,
-        VmpApplyDftToDftAccumulate, VmpApplyDftToDftAccumulateTmpBytes, VmpApplyDftToDftTmpBytes, VmpExtractSelectedRows,
+        VmpApplyDftToDftAccumulate, VmpApplyDftToDftAccumulateTmpBytes, VmpApplyDftToDftDual, VmpApplyDftToDftDualAccumulate,
+        VmpApplyDftToDftDualAccumulateTmpBytes, VmpApplyDftToDftDualTmpBytes, VmpApplyDftToDftTmpBytes, VmpExtractSelectedRows,
         VmpPMatAlloc, VmpPrepare, VmpPrepareTmpBytes,
     },
     layouts::{Backend, DigestU64, FillUniform, HostBytesBackend, MatZnx, MatZnxToBackendRef, Module, ScratchOwned},
@@ -745,5 +746,299 @@ pub fn test_vmp_apply_dft_to_dft_accumulate<BR: crate::test_suite::TestBackend, 
                 }
             }
         }
+    }
+}
+
+/// Checks the dual VMP overwrite and accumulate APIs against two independent
+/// single-output calls on each backend. This exercises the NTT4x30 fused path
+/// while the FFT64 backend remains a valid fallback implementation.
+pub fn test_vmp_apply_dft_to_dft_dual<BR: crate::test_suite::TestBackend, BT: crate::test_suite::TestBackend>(
+    params: &TestParams,
+    module_host: &Module<HostBytesBackend>,
+    module_ref: &Module<BR>,
+    module_test: &Module<BT>,
+) where
+    Module<BR>: ModuleNew<BR>
+        + VmpApplyDftToDftTmpBytes
+        + VmpApplyDftToDft<BR>
+        + VmpApplyDftToDftAccumulateTmpBytes
+        + VmpApplyDftToDftAccumulate<BR>
+        + VmpApplyDftToDftDualTmpBytes
+        + VmpApplyDftToDftDual<BR>
+        + VmpApplyDftToDftDualAccumulateTmpBytes
+        + VmpApplyDftToDftDualAccumulate<BR>
+        + VmpPMatAlloc<BR>
+        + VecZnxDftAlloc<BR>
+        + VmpPrepare<BR>
+        + VecZnxBigAlloc<BR>
+        + VecZnxIdftApplyTmpA<BR>
+        + VecZnxBigNormalize<BR>
+        + VecZnxDftApply<BR>
+        + VmpPrepareTmpBytes
+        + VecZnxBigNormalizeTmpBytes,
+    ScratchOwned<BR>: ScratchOwnedAlloc<BR>,
+    Module<BT>: ModuleNew<BT>
+        + VmpApplyDftToDftTmpBytes
+        + VmpApplyDftToDft<BT>
+        + VmpApplyDftToDftAccumulateTmpBytes
+        + VmpApplyDftToDftAccumulate<BT>
+        + VmpApplyDftToDftDualTmpBytes
+        + VmpApplyDftToDftDual<BT>
+        + VmpApplyDftToDftDualAccumulateTmpBytes
+        + VmpApplyDftToDftDualAccumulate<BT>
+        + VmpPMatAlloc<BT>
+        + VecZnxDftAlloc<BT>
+        + VmpPrepare<BT>
+        + VecZnxBigAlloc<BT>
+        + VecZnxIdftApplyTmpA<BT>
+        + VecZnxBigNormalize<BT>
+        + VecZnxDftApply<BT>
+        + VmpPrepareTmpBytes
+        + VecZnxBigNormalizeTmpBytes,
+    ScratchOwned<BT>: ScratchOwnedAlloc<BT>,
+{
+    check_vmp_dual_one(params, module_host, module_ref);
+    check_vmp_dual_one(params, module_host, module_test);
+}
+
+fn check_vmp_dual_one<BE: crate::test_suite::TestBackend>(
+    params: &TestParams,
+    module_host: &Module<HostBytesBackend>,
+    module: &Module<BE>,
+) where
+    Module<BE>: ModuleNew<BE>
+        + VmpApplyDftToDftTmpBytes
+        + VmpApplyDftToDft<BE>
+        + VmpApplyDftToDftAccumulateTmpBytes
+        + VmpApplyDftToDftAccumulate<BE>
+        + VmpApplyDftToDftDualTmpBytes
+        + VmpApplyDftToDftDual<BE>
+        + VmpApplyDftToDftDualAccumulateTmpBytes
+        + VmpApplyDftToDftDualAccumulate<BE>
+        + VmpPMatAlloc<BE>
+        + VecZnxDftAlloc<BE>
+        + VmpPrepare<BE>
+        + VecZnxBigAlloc<BE>
+        + VecZnxIdftApplyTmpA<BE>
+        + VecZnxBigNormalize<BE>
+        + VecZnxDftApply<BE>
+        + VmpPrepareTmpBytes
+        + VecZnxBigNormalizeTmpBytes,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE>,
+{
+    let base2k = params.base2k;
+    let (cols_in, cols_out, size, rows) = (2usize, 2usize, 4usize, 4usize);
+    let mut source = Source::new([0x24u8; 32]);
+
+    let mut a0 = module_host.vec_znx_alloc(cols_in, size);
+    let mut a1 = module_host.vec_znx_alloc(cols_in, size);
+    a0.fill_uniform(base2k, &mut source);
+    a1.fill_uniform(base2k, &mut source);
+    let a0_backend = upload_vec_znx::<BE>(&a0);
+    let a1_backend = upload_vec_znx::<BE>(&a1);
+
+    let mut mat = module_host.mat_znx_alloc(rows, cols_in, cols_out, size);
+    mat.fill_uniform(base2k, &mut source);
+    let mat_backend = upload_mat_znx::<BE>(&mat);
+    let mut pmat = module.vmp_pmat_alloc(rows, cols_in, cols_out, size);
+
+    let scratch_bytes = module
+        .vmp_apply_dft_to_dft_dual_tmp_bytes(size, size, rows, cols_in, cols_out, size)
+        .max(module.vmp_apply_dft_to_dft_dual_accumulate_tmp_bytes(size, size, rows, cols_in, cols_out, size))
+        .max(module.vmp_apply_dft_to_dft_tmp_bytes(size, size, rows, cols_in, cols_out, size))
+        .max(module.vmp_apply_dft_to_dft_accumulate_tmp_bytes(size, size, rows, cols_in, cols_out, size))
+        .max(module.vmp_prepare_tmp_bytes(rows, cols_in, cols_out, size))
+        .max(module.vec_znx_big_normalize_tmp_bytes());
+    let mut scratch = ScratchOwned::<BE>::alloc(scratch_bytes);
+    module.vmp_prepare(
+        &mut pmat.to_backend_mut(),
+        &<MatZnx<BE::OwnedBuf, i64> as MatZnxToBackendRef<BE>>::to_backend_ref(&mat_backend),
+        &mut scratch.arena(),
+    );
+
+    let mut a0_dft = module.vec_znx_dft_alloc(cols_in, size);
+    let mut a1_dft = module.vec_znx_dft_alloc(cols_in, size);
+    for col in 0..cols_in {
+        module.vec_znx_dft_apply(
+            1,
+            0,
+            &mut a0_dft.to_backend_mut(),
+            col,
+            &vec_znx_backend_ref::<BE>(&a0_backend),
+            col,
+        );
+        module.vec_znx_dft_apply(
+            1,
+            0,
+            &mut a1_dft.to_backend_mut(),
+            col,
+            &vec_znx_backend_ref::<BE>(&a1_backend),
+            col,
+        );
+    }
+
+    let mut dual0 = module.vec_znx_dft_alloc(cols_out, size);
+    let mut dual1 = module.vec_znx_dft_alloc(cols_out, size);
+    let mut ref0 = module.vec_znx_dft_alloc(cols_out, size);
+    let mut ref1 = module.vec_znx_dft_alloc(cols_out, size);
+    module.vmp_apply_dft_to_dft_dual(
+        &mut dual0.to_backend_mut(),
+        &mut dual1.to_backend_mut(),
+        &a0_dft.to_backend_ref(),
+        &a1_dft.to_backend_ref(),
+        &pmat.to_backend_ref(),
+        0,
+        &mut scratch.arena(),
+    );
+    module.vmp_apply_dft_to_dft(
+        &mut ref0.to_backend_mut(),
+        &a0_dft.to_backend_ref(),
+        &pmat.to_backend_ref(),
+        0,
+        &mut scratch.arena(),
+    );
+    module.vmp_apply_dft_to_dft(
+        &mut ref1.to_backend_mut(),
+        &a1_dft.to_backend_ref(),
+        &pmat.to_backend_ref(),
+        0,
+        &mut scratch.arena(),
+    );
+    assert_vmp_dft_pair_eq(
+        module,
+        module_host,
+        base2k,
+        &mut scratch,
+        &mut dual0,
+        &mut dual1,
+        &mut ref0,
+        &mut ref1,
+    );
+
+    // Accumulate into identical non-zero initial values.
+    let mut init = module_host.vec_znx_alloc(cols_out, size);
+    init.fill_uniform(base2k, &mut source);
+    let init_backend = upload_vec_znx::<BE>(&init);
+    let mut acc0 = module.vec_znx_dft_alloc(cols_out, size);
+    let mut acc1 = module.vec_znx_dft_alloc(cols_out, size);
+    let mut acc_ref0 = module.vec_znx_dft_alloc(cols_out, size);
+    let mut acc_ref1 = module.vec_znx_dft_alloc(cols_out, size);
+    for col in 0..cols_out {
+        module.vec_znx_dft_apply(
+            1,
+            0,
+            &mut acc0.to_backend_mut(),
+            col,
+            &vec_znx_backend_ref::<BE>(&init_backend),
+            col,
+        );
+        module.vec_znx_dft_apply(
+            1,
+            0,
+            &mut acc1.to_backend_mut(),
+            col,
+            &vec_znx_backend_ref::<BE>(&init_backend),
+            col,
+        );
+        module.vec_znx_dft_apply(
+            1,
+            0,
+            &mut acc_ref0.to_backend_mut(),
+            col,
+            &vec_znx_backend_ref::<BE>(&init_backend),
+            col,
+        );
+        module.vec_znx_dft_apply(
+            1,
+            0,
+            &mut acc_ref1.to_backend_mut(),
+            col,
+            &vec_znx_backend_ref::<BE>(&init_backend),
+            col,
+        );
+    }
+    module.vmp_apply_dft_to_dft_dual_accumulate(
+        &mut acc0.to_backend_mut(),
+        &mut acc1.to_backend_mut(),
+        &a0_dft.to_backend_ref(),
+        &a1_dft.to_backend_ref(),
+        &pmat.to_backend_ref(),
+        0,
+        &mut scratch.arena(),
+    );
+    module.vmp_apply_dft_to_dft_accumulate(
+        &mut acc_ref0.to_backend_mut(),
+        &a0_dft.to_backend_ref(),
+        &pmat.to_backend_ref(),
+        0,
+        &mut scratch.arena(),
+    );
+    module.vmp_apply_dft_to_dft_accumulate(
+        &mut acc_ref1.to_backend_mut(),
+        &a1_dft.to_backend_ref(),
+        &pmat.to_backend_ref(),
+        0,
+        &mut scratch.arena(),
+    );
+    assert_vmp_dft_pair_eq(
+        module,
+        module_host,
+        base2k,
+        &mut scratch,
+        &mut acc0,
+        &mut acc1,
+        &mut acc_ref0,
+        &mut acc_ref1,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_vmp_dft_pair_eq<BE: crate::test_suite::TestBackend>(
+    module: &Module<BE>,
+    module_host: &Module<HostBytesBackend>,
+    base2k: usize,
+    scratch: &mut ScratchOwned<BE>,
+    got0: &mut VecZnxDftOwned<BE>,
+    got1: &mut VecZnxDftOwned<BE>,
+    want0: &mut VecZnxDftOwned<BE>,
+    want1: &mut VecZnxDftOwned<BE>,
+) where
+    Module<BE>: VecZnxBigAlloc<BE> + VecZnxIdftApplyTmpA<BE> + VecZnxBigNormalize<BE>,
+{
+    let cols = got0.cols();
+    let size = got0.size();
+    let got0_big = idft_into_alloc(module, got0);
+    let got1_big = idft_into_alloc(module, got1);
+    let want0_big = idft_into_alloc(module, want0);
+    let want1_big = idft_into_alloc(module, want1);
+    let template = module_host.vec_znx_alloc(cols, size);
+    for (got_big, want_big) in [(&got0_big, &want0_big), (&got1_big, &want1_big)] {
+        let mut got_small = upload_vec_znx::<BE>(&template);
+        let mut want_small = upload_vec_znx::<BE>(&template);
+        for col in 0..cols {
+            module.vec_znx_big_normalize(
+                &mut vec_znx_backend_mut::<BE>(&mut got_small),
+                base2k,
+                size * base2k,
+                0,
+                col,
+                &got_big.to_backend_ref(),
+                base2k,
+                col,
+                &mut scratch.arena(),
+            );
+            module.vec_znx_big_normalize(
+                &mut vec_znx_backend_mut::<BE>(&mut want_small),
+                base2k,
+                size * base2k,
+                0,
+                col,
+                &want_big.to_backend_ref(),
+                base2k,
+                col,
+                &mut scratch.arena(),
+            );
+        }
+        assert_eq!(download_vec_znx::<BE>(&got_small), download_vec_znx::<BE>(&want_small));
     }
 }

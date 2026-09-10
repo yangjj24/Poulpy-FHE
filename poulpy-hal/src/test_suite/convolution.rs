@@ -915,3 +915,137 @@ fn negacyclic_convolution_naive(res: &mut [i64], a: &[i64], b: &[i64]) {
         }
     }
 }
+
+/// `cnv_accumulate_dft_dual` must match two independent fused accumulations
+/// after normalization. The two term sets deliberately reuse the same left
+/// prepared operands with different right-column pairings, matching SHIP.
+pub fn test_convolution_accumulate_dual<M, BE: crate::test_suite::TestBackend>(module: &M, base2k: usize)
+where
+    M: ModuleN
+        + Convolution<BE>
+        + CnvPVecAlloc<BE>
+        + VecZnxDftAlloc<BE>
+        + VecZnxIdftApplyTmpA<BE>
+        + VecZnxBigNormalize<BE>
+        + VecZnxBigNormalizeTmpBytes
+        + VecZnxBigAlloc<BE>,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE>,
+{
+    use crate::layouts::CnvDftAccTerm;
+
+    let mut source = Source::new([0x42u8; 32]);
+    let cols = 2usize;
+    let a_size = 9usize;
+    let b_size = 9usize;
+    let res_size = a_size + b_size;
+
+    let mut a = VecZnx::alloc(module.n(), cols, a_size);
+    let mut b = VecZnx::alloc(module.n(), cols, b_size);
+    a.fill_uniform(17, &mut source);
+    b.fill_uniform(17, &mut source);
+    let a_backend = upload_vec_znx::<BE>(&a);
+    let b_backend = upload_vec_znx::<BE>(&b);
+
+    let mut a_prep = module.cnv_pvec_left_alloc(cols, a_size);
+    let mut b_prep = module.cnv_pvec_right_alloc(cols, b_size);
+    let mut scratch = ScratchOwned::<BE>::alloc(
+        module
+            .cnv_accumulate_dft_dual_tmp_bytes(0, res_size, a_size, b_size)
+            .max(module.cnv_accumulate_dft_tmp_bytes(0, res_size, a_size, b_size))
+            .max(module.cnv_prepare_left_tmp_bytes(a_size, a_size))
+            .max(module.cnv_prepare_right_tmp_bytes(b_size, b_size))
+            .max(module.vec_znx_big_normalize_tmp_bytes()),
+    );
+    module.cnv_prepare_left(
+        &mut a_prep.to_backend_mut(),
+        &vec_znx_backend_ref::<BE>(&a_backend),
+        !0i64,
+        &mut scratch.arena(),
+    );
+    module.cnv_prepare_right(
+        &mut b_prep.to_backend_mut(),
+        &vec_znx_backend_ref::<BE>(&b_backend),
+        !0i64,
+        &mut scratch.arena(),
+    );
+
+    let pairs0 = [(0usize, 0usize), (1, 1), (0, 1)];
+    let pairs1 = [(0usize, 1usize), (1, 0), (1, 1)];
+    for cnv_offset in (0..res_size).step_by(4) {
+        let terms0: Vec<CnvDftAccTerm<'_, BE>> = pairs0
+            .iter()
+            .map(|&(ac, bc)| CnvDftAccTerm {
+                a: a_prep.to_backend_ref(),
+                a_col: ac,
+                b: b_prep.to_backend_ref(),
+                b_col: bc,
+            })
+            .collect();
+        let terms1: Vec<CnvDftAccTerm<'_, BE>> = pairs1
+            .iter()
+            .map(|&(ac, bc)| CnvDftAccTerm {
+                a: a_prep.to_backend_ref(),
+                a_col: ac,
+                b: b_prep.to_backend_ref(),
+                b_col: bc,
+            })
+            .collect();
+
+        let mut dual = module.vec_znx_dft_alloc(2, res_size);
+        let mut ref0 = module.vec_znx_dft_alloc(1, res_size);
+        let mut ref1 = module.vec_znx_dft_alloc(1, res_size);
+        module.cnv_accumulate_dft_dual(
+            cnv_offset,
+            &mut dual.to_backend_mut(),
+            0,
+            &terms0,
+            1,
+            &terms1,
+            &mut scratch.arena(),
+        );
+        module.cnv_accumulate_dft(cnv_offset, &mut ref0.to_backend_mut(), 0, &terms0, &mut scratch.arena());
+        module.cnv_accumulate_dft(cnv_offset, &mut ref1.to_backend_mut(), 0, &terms1, &mut scratch.arena());
+
+        let mut dual_big = module.vec_znx_big_alloc(2, res_size);
+        let mut ref0_big = module.vec_znx_big_alloc(1, res_size);
+        let mut ref1_big = module.vec_znx_big_alloc(1, res_size);
+        module.vec_znx_idft_apply_tmpa(&mut dual_big.to_backend_mut(), 0, &mut dual.to_backend_mut(), 0);
+        module.vec_znx_idft_apply_tmpa(&mut dual_big.to_backend_mut(), 1, &mut dual.to_backend_mut(), 1);
+        module.vec_znx_idft_apply_tmpa(&mut ref0_big.to_backend_mut(), 0, &mut ref0.to_backend_mut(), 0);
+        module.vec_znx_idft_apply_tmpa(&mut ref1_big.to_backend_mut(), 0, &mut ref1.to_backend_mut(), 0);
+
+        let host_template = VecZnx::alloc(module.n(), 2, res_size);
+        let mut have = upload_vec_znx::<BE>(&host_template);
+        let mut want = upload_vec_znx::<BE>(&host_template);
+        for col in 0..2 {
+            module.vec_znx_big_normalize(
+                &mut vec_znx_backend_mut::<BE>(&mut have),
+                base2k,
+                res_size * base2k,
+                0,
+                col,
+                &dual_big.to_backend_ref(),
+                base2k,
+                col,
+                &mut scratch.arena(),
+            );
+            let src = if col == 0 { &ref0_big } else { &ref1_big };
+            module.vec_znx_big_normalize(
+                &mut vec_znx_backend_mut::<BE>(&mut want),
+                base2k,
+                res_size * base2k,
+                0,
+                col,
+                &src.to_backend_ref(),
+                base2k,
+                0,
+                &mut scratch.arena(),
+            );
+        }
+        assert_eq!(
+            download_vec_znx::<BE>(&have),
+            download_vec_znx::<BE>(&want),
+            "dual convolution mismatch at offset {cnv_offset}"
+        );
+    }
+}

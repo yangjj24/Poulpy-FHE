@@ -1,4 +1,4 @@
-use crate::CKKSResult as Result;
+use crate::{CKKSResult as Result, ckks_ensure};
 use poulpy_core::layouts::IntPolyInfos;
 use poulpy_core::{
     GLWEAdd, GLWECopy, GLWEMulConst, GLWEMulPlain, GLWERotate, GLWETensoring,
@@ -57,6 +57,16 @@ where
         BE::ckks_mul_tmp_bytes_impl(self, res, a, b, tsk)
     }
 
+    fn ckks_mul_dual_tmp_bytes<R, A, B, T>(&self, res: &R, a: &A, b: &B, tsk: &T) -> usize
+    where
+        R: CKKSCtBounds,
+        A: CKKSCtBounds,
+        B: CKKSCtBounds,
+        T: GGLWEInfos,
+    {
+        BE::ckks_mul_dual_tmp_bytes_impl(self, res, a, b, tsk)
+    }
+
     fn ckks_square_tmp_bytes<R, A, T>(&self, res: &R, a: &A, tsk: &T) -> usize
     where
         R: CKKSCtBounds,
@@ -98,6 +108,49 @@ where
                 k: k.into(),
             })?;
         BE::ckks_mul_into_impl(self, dst, a, b, tsk, scratch)
+    }
+
+    fn ckks_mul_into_dual<Dst, A, B, H>(
+        &self,
+        dst0: &mut Dst,
+        a0: &A,
+        b0: &B,
+        dst1: &mut Dst,
+        a1: &A,
+        b1: &B,
+        tsk: &H,
+        scratch: &mut ScratchArena<'_, BE>,
+    ) -> Result<()>
+    where
+        Dst: GLWEToBackendMut<BE> + CKKSCtBounds + SetCKKSInfos,
+        A: GLWEToBackendRef<BE> + CKKSCtBounds,
+        B: GLWEToBackendRef<BE> + CKKSCtBounds,
+        H: GetTensorKey<BE>,
+    {
+        let k0 = mul_k(a0, b0);
+        let k1 = mul_k(a1, b1);
+        ckks_ensure!(k0 == k1, "ckks_mul_into_dual: tensor precisions differ");
+        ckks_ensure!(
+            dst0.n() == dst1.n() && dst0.base2k() == dst1.base2k() && dst0.rank() == dst1.rank() && dst0.k() == dst1.k(),
+            "ckks_mul_into_dual: destination layouts differ"
+        );
+        ckks_ensure!(
+            a0.n() == a1.n()
+                && a0.base2k() == a1.base2k()
+                && a0.rank() == a1.rank()
+                && a0.k() == a1.k()
+                && b0.n() == b1.n()
+                && b0.base2k() == b1.base2k()
+                && b0.rank() == b1.rank()
+                && b0.k() == b1.k(),
+            "ckks_mul_into_dual: operand layouts differ"
+        );
+        tsk.get_tensor_key(k0)
+            .map_err(|_| CKKSCompositionError::MissingRelinearizationKey {
+                op: "ckks_mul_into_dual",
+                k: k0.into(),
+            })?;
+        BE::ckks_mul_into_dual_impl(self, dst0, a0, b0, dst1, a1, b1, tsk, scratch)
     }
 
     fn ckks_mul_assign<Dst, A, H>(&self, dst: &mut Dst, a: &A, tsk: &H, scratch: &mut ScratchArena<'_, BE>) -> Result<()>

@@ -554,7 +554,8 @@ where
 }
 
 /// End-to-end complex SHIP bootstrap: `Re`/`Im` coefficient halves refreshed
-/// into complex slots through the shared mux keys and the `omega_2` masks.
+/// into complex slots through one shared selector-mask family, the fixed
+/// omega_2 pi permutation, and shared H-MUX/tensor-key dataflow.
 pub fn test_ship_bootstrap_complex<BE, F, E>(params: CKKSTestParams, module: &Module<BE>, host_module: &Module<HostBytesBackend>)
 where
     BE: TestContextBackend + CKKSShipCoeffEncodingImpl<BE> + CKKSEncodingImpl<BE, F>,

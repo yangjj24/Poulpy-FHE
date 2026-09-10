@@ -36,10 +36,25 @@ where
     let work = module
         .cnv_prepare_right_tmp_bytes(b_size, b_size)
         .max(module.cnv_accumulate_dft_tmp_bytes(0, res_dft_size, a_size, b_size))
+        .max(module.bytes_of_vec_znx_big(2, res_dft_size) + module.vec_znx_big_normalize_tmp_bytes());
+    module.bytes_of_vec_znx_dft(2, res_dft_size) + preps + work
+}
+
+/// Scratch bytes for [`ship_masking_accumulate_dual`]. The canonical RHS
+/// preparations are shared, while both two-column DFT sums remain live.
+pub(crate) fn ship_masking_dual_tmp_bytes<BE>(module: &Module<BE>, plan: &ShipPlan, base2k: usize) -> usize
+where
+    BE: Backend,
+    Module<BE>: Convolution<BE> + CnvPVecBytesOf + VecZnxDftBytesOf + VecZnxBigBytesOf + VecZnxBigNormalizeTmpBytes,
+{
+    let a_size = plan.raised_k(base2k).div_ceil(base2k);
+    let b_size = (plan.log_delta_work() + base2k).div_ceil(base2k);
+    let res_dft_size = a_size + b_size;
+    let preps = 4 * plan.theta() * module.bytes_of_cnv_pvec_right(1, b_size);
+    let work = module
+        .cnv_prepare_right_tmp_bytes(b_size, b_size)
         .max(module.cnv_accumulate_dft_dual_tmp_bytes(0, res_dft_size, a_size, b_size))
         .max(module.bytes_of_vec_znx_big(2, res_dft_size) + module.vec_znx_big_normalize_tmp_bytes());
-    // The complex path keeps both two-column DFT sums live together.
-    // The real-only path over-allocates this temporary by two columns.
     module.bytes_of_vec_znx_dft(4, res_dft_size) + preps + work
 }
 
@@ -64,7 +79,6 @@ where
     const OP: &str = "ship_masking_accumulate";
     ckks_ensure!(
         !masks.is_empty() && masks.len() == pis.len() && masks.len() % 4 == 0,
-        // "{OP}: empty or mismatched operands"
         "{OP}: empty, mismatched, or malformed operands"
     );
     let base2k = acc.base2k().as_usize();
@@ -103,40 +117,9 @@ where
             .apply_mut(|s| module.cnv_prepare_right(&mut b_prep, GLWEToBackendRef::<BE>::to_backend_ref(pi).data(), b_mask, s));
         preps.push(b_prep);
     }
-    // for (i, mask) in masks.iter().enumerate() {
-    //     let candidate_base = (i / 4) * 4;
-    //     let band = i % 4;
-    //     let pi_idx = candidate_base + band_order[band];
-    //     let pi = &pis[pi_idx];
-
-    //     ckks_ensure!(
-    //         mask.size() == a_size && pi.size() == b_size,
-    //         "{OP}: inconsistent operand sizes"
-    //     );
-
-    //     let (mut b_prep, next) = rest.take_cnv_pvec_right_scratch(module, 1, b_size);
-
-    //     rest = next
-    //         .apply_mut(|s| module.cnv_prepare_right(&mut b_prep, GLWEToBackendRef::<BE>::to_backend_ref(pi).data(), b_mask, s));
-
-    //     preps.push(b_prep);
-    // }
 
     {
         let mut sum_dft_mut = sum_dft.to_backend_mut();
-        // for col in 0..2 {
-        //     let terms: Vec<CnvDftAccTerm<'_, BE>> = masks
-        //         .iter()
-        //         .zip(&preps)
-        //         .map(|(mask, prep)| CnvDftAccTerm {
-        //             a: mask.to_backend_ref(),
-        //             a_col: col,
-        //             b: prep.to_backend_ref(),
-        //             b_col: 0,
-        //         })
-        //         .collect();
-        //     module.cnv_accumulate_dft(cnv_offset_hi, &mut sum_dft_mut, col, &terms, &mut rest.borrow());
-        // }
         for col in 0..2 {
             let terms: Vec<CnvDftAccTerm<'_, BE>> = masks
                 .iter()
@@ -253,21 +236,8 @@ where
 
     let res_dft_size = a_size + b_size - cnv_offset_hi;
 
-    /*
-     * Scratch layout:
-     *
-     *   sum_dft
-     *   prepared(pi1 ... pi_{4 theta})
-     *   reusable work area
-     *
-     * The work area is reused sequentially by:
-     *   - real convolution
-     *   - real IDFT/normalize
-     *   - imag convolution
-     *   - imag IDFT/normalize
-     *
-     * Therefore ship_masking_tmp_bytes() does not need to grow.
-     */
+    // Four DFT columns keep the real and imaginary sums live together; the
+    // canonical prepared pi operands and the Big/normalize workspace are shared.
     let scratch = scratch.borrow();
 
     let (mut sum_dft, scratch_1) = scratch.take_vec_znx_dft_scratch(module, 4, res_dft_size);

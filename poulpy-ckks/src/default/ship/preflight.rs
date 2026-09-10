@@ -17,7 +17,11 @@ use poulpy_hal::{
     layouts::{Backend, Module},
 };
 
-use super::{bootstrap::validate_runtime, masking::ship_masking_tmp_bytes, mux::ship_mux_rotate_tmp_bytes};
+use super::{
+    bootstrap::validate_runtime,
+    masking::{ship_masking_dual_tmp_bytes, ship_masking_tmp_bytes},
+    mux::{ship_mux_rotate_dual_tmp_bytes, ship_mux_rotate_tmp_bytes},
+};
 use crate::SlotsKind;
 use crate::{
     CKKSCtBounds,
@@ -92,15 +96,27 @@ where
         params.complex(),
     )?);
     bytes = bytes.max(module.ckks_add_pt_vec_tmp_bytes());
-    bytes = bytes.max(ship_masking_tmp_bytes(module, plan, base2k));
+    bytes = bytes.max(if params.complex() {
+        ship_masking_dual_tmp_bytes(module, plan, base2k)
+    } else {
+        ship_masking_tmp_bytes(module, plan, base2k)
+    });
     for ik in keys.index_keys() {
         for group in ik.mux_keys() {
             if let Some(mux) = group.first() {
-                bytes = bytes.max(ship_mux_rotate_tmp_bytes(module, &raised, &mux.key, group.len()));
+                bytes = bytes.max(if params.complex() {
+                    ship_mux_rotate_dual_tmp_bytes(module, &raised, &mux.key, group.len())
+                } else {
+                    ship_mux_rotate_tmp_bytes(module, &raised, &mux.key, group.len())
+                });
             }
         }
     }
-    bytes = bytes.max(module.ckks_mul_tmp_bytes(&raised, &raised, &raised, keys.tensor_key()));
+    bytes = bytes.max(if params.complex() {
+        module.ckks_mul_dual_tmp_bytes(&raised, &raised, &raised, keys.tensor_key())
+    } else {
+        module.ckks_mul_tmp_bytes(&raised, &raised, &raised, keys.tensor_key())
+    });
     bytes = bytes.max(module.ckks_conjugate_tmp_bytes(&raised, keys.conjugation_key()));
     bytes = bytes.max(module.ckks_add_tmp_bytes());
     bytes = bytes.max(module.ckks_sub_tmp_bytes());

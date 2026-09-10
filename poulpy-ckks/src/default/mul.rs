@@ -1,4 +1,4 @@
-use crate::CKKSResult as Result;
+use crate::{CKKSResult as Result, ckks_ensure};
 use poulpy_core::layouts::GetTensorKey;
 use poulpy_core::layouts::IntPolyInfos;
 use poulpy_core::{
@@ -54,6 +54,31 @@ pub trait CKKSMulDefault<BE: Backend> {
         lvl_0 + lvl_1
     }
 
+    fn ckks_mul_dual_tmp_bytes_default<R, A, B, T>(&self, res: &R, a: &A, b: &B, tsk: &T) -> usize
+    where
+        Self: GLWEBytesOf<BE> + GLWETensoring<BE>,
+        R: GLWEInfos,
+        A: GLWEInfos,
+        B: GLWEInfos,
+        T: GGLWEInfos,
+    {
+        let tensor_layout = GLWELayout {
+            n: res.n(),
+            base2k: res.base2k(),
+            k: a.k().max(b.k()),
+            rank: res.rank(),
+        };
+        if tensor_layout.k().as_u32() == 0 {
+            return 0;
+        }
+
+        // Two tensor products must remain live until the shared relinearization.
+        let tensors = 2 * self.glwe_tensor_bytes_of_from_infos(&tensor_layout);
+        let apply = self.glwe_tensor_apply_tmp_bytes(&tensor_layout, a, b);
+        let relin = self.glwe_tensor_relinearize_dual_tmp_bytes(res, res, &tensor_layout, &tensor_layout, tsk);
+        tensors + apply.max(relin)
+    }
+
     fn ckks_mul_into_default<Dst, A, B, T>(
         &self,
         dst: &mut Dst,
@@ -87,6 +112,67 @@ pub trait CKKSMulDefault<BE: Backend> {
             scratch,
             |tmp, _dst, s| self.glwe_tensor_apply(cnv_offset, tmp, a, b, s),
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ckks_mul_into_dual_default<Dst, A, B, T>(
+        &self,
+        dst0: &mut Dst,
+        a0: &A,
+        b0: &B,
+        dst1: &mut Dst,
+        a1: &A,
+        b1: &B,
+        tsk: &T,
+        scratch: &mut ScratchArena<'_, BE>,
+    ) -> Result<()>
+    where
+        Self: GLWETensoring<BE>,
+        Dst: GLWEToBackendMut<BE> + CKKSInfos + SetCKKSInfos + GLWEInfos,
+        A: GLWEToBackendRef<BE> + CKKSInfos + GLWEInfos,
+        B: GLWEToBackendRef<BE> + CKKSInfos + GLWEInfos,
+        T: GetTensorKey<BE>,
+    {
+        let (budget0, delta0, cnv_offset0) = get_mul_ct_params(dst0, a0, b0)?;
+        let (budget1, delta1, cnv_offset1) = get_mul_ct_params(dst1, a1, b1)?;
+        let tensor_k0 = a0.k().max(b0.k());
+        let tensor_k1 = a1.k().max(b1.k());
+
+        ckks_ensure!(tensor_k0 == tensor_k1, "dual mul tensor precisions differ");
+        ckks_ensure!(
+            dst0.n() == dst1.n() && dst0.base2k() == dst1.base2k() && dst0.rank() == dst1.rank(),
+            "dual mul destination layouts differ"
+        );
+        ckks_ensure!(budget0 == budget1 && delta0 == delta1, "dual mul output metadata differ");
+
+        let stamp0 = MulStamp {
+            log_budget: budget0,
+            log_delta: delta0,
+            log_sparsity: Some(a0.log_sparsity().min(b0.log_sparsity())),
+            slots: Some(a0.slots().join(b0.slots())),
+        };
+        let stamp1 = MulStamp {
+            log_budget: budget1,
+            log_delta: delta1,
+            log_sparsity: Some(a1.log_sparsity().min(b1.log_sparsity())),
+            slots: Some(a1.slots().join(b1.slots())),
+        };
+        apply_mul_stamp(dst0, &stamp0);
+        apply_mul_stamp(dst1, &stamp1);
+
+        let tensor_layout = GLWELayout {
+            n: dst0.n(),
+            base2k: dst0.base2k(),
+            k: tensor_k0,
+            rank: dst0.rank(),
+        };
+        let scratch_local = scratch.borrow();
+        let (mut tmp0, scratch_1) = scratch_local.take_glwe_tensor_scratch(&tensor_layout);
+        let (mut tmp1, mut work) = scratch_1.take_glwe_tensor_scratch(&tensor_layout);
+        self.glwe_tensor_apply(cnv_offset0, &mut tmp0, a0, b0, &mut work.borrow());
+        self.glwe_tensor_apply(cnv_offset1, &mut tmp1, a1, b1, &mut work.borrow());
+        self.glwe_tensor_relinearize_dual(dst0, dst1, &tmp0, &tmp1, tsk, &mut work);
+        Ok(())
     }
 
     fn ckks_mul_assign_default<Dst, A, T>(&self, dst: &mut Dst, a: &A, tsk: &T, scratch: &mut ScratchArena<'_, BE>) -> Result<()>
@@ -427,6 +513,17 @@ enum StampOrder {
     AfterApply,
 }
 
+fn apply_mul_stamp<D: SetCKKSInfos>(dst: &mut D, stamp: &MulStamp) {
+    dst.set_log_budget(stamp.log_budget);
+    dst.set_log_delta(stamp.log_delta);
+    if let Some(log_sparsity) = stamp.log_sparsity {
+        dst.set_log_sparsity(log_sparsity);
+    }
+    if let Some(slots) = stamp.slots {
+        dst.set_slots(slots);
+    }
+}
+
 /// Shared body of the five tensor-multiplication variants (`mul_into`,
 /// `mul_assign`, `mul_prepared_assign`, `square_into`, `square_assign`):
 /// stamp (per `order`), carve the tensor intermediate at `tensor_k`, run the
@@ -451,18 +548,8 @@ where
     Dst: GLWEToBackendMut<BE> + CKKSInfos + SetCKKSInfos + GLWEInfos,
     T: GetTensorKey<BE>,
 {
-    let do_stamp = |dst: &mut Dst| {
-        dst.set_log_budget(stamp.log_budget);
-        dst.set_log_delta(stamp.log_delta);
-        if let Some(log_sparsity) = stamp.log_sparsity {
-            dst.set_log_sparsity(log_sparsity);
-        }
-        if let Some(slots) = stamp.slots {
-            dst.set_slots(slots);
-        }
-    };
     if matches!(order, StampOrder::BeforeApply) {
-        do_stamp(dst);
+        apply_mul_stamp(dst, &stamp);
     }
 
     let tensor_layout = GLWELayout {
@@ -475,7 +562,7 @@ where
     let (mut tmp, mut scratch_local) = scratch_local.take_glwe_tensor_scratch(&tensor_layout);
     apply(&mut tmp, &*dst, &mut scratch_local);
     if matches!(order, StampOrder::AfterApply) {
-        do_stamp(dst);
+        apply_mul_stamp(dst, &stamp);
     }
     module.glwe_tensor_relinearize(dst, &tmp, tsk, &mut scratch_local);
     Ok(())

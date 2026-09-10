@@ -46,9 +46,6 @@ where
 }
 
 /// Scratch bytes for [`ship_mux_rotate`].
-///
-/// This returns the maximum of the single- and dual-path requirements so the
-/// existing SHIP preflight remains a safe upper bound for complex bootstrap.
 pub(crate) fn ship_mux_rotate_tmp_bytes<BE, C, K>(module: &Module<BE>, ct: &C, key: &K, term_count: usize) -> usize
 where
     BE: Backend,
@@ -64,7 +61,8 @@ where
     let finalize = module.bytes_of_vec_znx_big(2, output_size) + module.vec_znx_big_normalize_tmp_bytes();
     let single = module.bytes_of_vec_znx_dft(2, a_size) + module.bytes_of_vec_znx_dft(2, output_size) + mux.max(finalize);
 
-    single.max(ship_mux_rotate_dual_tmp_bytes(module, ct, key, term_count))
+    // single.max(ship_mux_rotate_dual_tmp_bytes(module, ct, key, term_count))
+    single
 }
 
 /// Scratch bytes for [`ship_mux_rotate_dual`]. Two input DFTs and two sums are

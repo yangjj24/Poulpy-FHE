@@ -17,7 +17,6 @@ use poulpy_hal::{
 };
 
 use super::{
-    // masking::ship_masking_accumulate,
     masking::{ship_masking_accumulate, ship_masking_accumulate_dual},
     mux::{ship_mux_plans, ship_mux_rotate, ship_mux_rotate_dual},
 };
@@ -52,7 +51,7 @@ where
     );
     ckks_ensure!(
         !complex || params.complex(),
-        "{OP}: keys lack the omega_2 masks (generate with complex)"
+        "{OP}: keys were not generated for complex bootstrap"
     );
     ckks_ensure!(
         input.n().as_usize() == plan.n() && input.rank().as_usize() == 1,
@@ -169,11 +168,6 @@ where
         leaves.push(half_leaves);
     }
 
-    // Leaves 1..=h: theta-column masking then hoisted base-B mux blind
-    // rotation over the remaining digits; the pi plaintexts and mux keys are
-    // shared between the halves, the mask sets differ. The mux rotation
-    // amounts recur across slots, so their automorphism plans are built once.
-
     // Leaves 1..=h: theta-column masking followed by the hoisted
     // base-B mux blind rotation.
     //
@@ -182,52 +176,13 @@ where
     // the pi plaintexts.  The omega_2 path differs only by the fixed
     // per-quartet pi permutation [2, 3, 1, 0].
     //
-    // H-MUX keys are also shared, although the two H-MUX evaluations
-    // are still executed independently here.
+    // H-MUX keys are shared and traversed in lockstep by the dual path.
     let plans = ship_mux_plans(
         module,
         keys.index_keys()
             .iter()
             .flat_map(|ik| ik.mux_keys().iter().map(Vec::as_slice)),
     );
-    // for (slot, ik) in keys.index_keys().iter().enumerate() {
-    //     let pi = &enc.pi[slot];
-    //     ckks_ensure!(pi.len() == 4 * theta, "{OP}: malformed pi encodings at slot {slot}");
-    //     // for (half, half_leaves) in leaves.iter_mut().enumerate() {
-    //     //     let masks = if half == 0 { ik.masks() } else { ik.masks2() };
-    //     //     let mut acc = module.ckks_ciphertext_alloc(b2k_t, TorusPrecision(kk as u32));
-    //     //     ship_masking_accumulate(module, &mut acc, &plan, masks, pi, scratch)?;
-    //     //     for group in ik.mux_keys() {
-    //     //         ship_mux_rotate(module, &mut acc, group, &plans, scratch)?;
-    //     //     }
-    //     //     half_leaves.push(acc);
-    //     // }
-    //     for (half, half_leaves) in leaves.iter_mut().enumerate() {
-    //         let band_order = if half == 0 {
-    //             // omega_1:
-    //             // M1*pi1 + M2*pi2 + M3*pi3 + M4*pi4
-    //             [0, 1, 2, 3]
-    //         } else {
-    //             // omega_2 masks satisfy
-    //             // [M2_1, M2_2, M2_3, M2_4] = [M4, M3, M1, M2].
-    //             //
-    //             // Therefore:
-    //             // M2_1*pi1 + M2_2*pi2 + M2_3*pi3 + M2_4*pi4
-    //             // = M1*pi3 + M2*pi4 + M3*pi2 + M4*pi1.
-    //             [2, 3, 1, 0]
-    //         };
-
-    //         let mut acc = module.ckks_ciphertext_alloc(b2k_t, TorusPrecision(kk as u32));
-
-    //         ship_masking_accumulate(module, &mut acc, &plan, ik.masks(), pi, band_order, scratch)?;
-
-    //         for group in ik.mux_keys() {
-    //             ship_mux_rotate(module, &mut acc, group, &plans, scratch)?;
-    //         }
-
-    //         half_leaves.push(acc);
-    //     }
-    // }
 
     for (slot, ik) in keys.index_keys().iter().enumerate() {
         let pi = &enc.pi[slot];
@@ -264,10 +219,66 @@ where
         }
     }
 
-    // Binary product tree per half; odd leftovers carry to the next level.
-    let mut roots = Vec::with_capacity(halves);
-    for half_leaves in leaves {
-        let mut level = half_leaves;
+    // Binary product tree. In the complex case the two trees have identical
+    // topology, so matching multiplications are evaluated in lockstep and
+    // share tensor-key relinearization. The tensor products themselves remain
+    // independent, avoiding real/imag cross terms.
+    let roots = if complex {
+        ckks_ensure!(
+            leaves.len() == 2 && leaves[0].len() == leaves[1].len(),
+            "{OP}: malformed complex product leaves"
+        );
+        let mut imag = leaves.pop().expect("imag leaves exist");
+        let mut real = leaves.pop().expect("real leaves exist");
+
+        while real.len() > 1 {
+            ckks_ensure!(real.len() == imag.len(), "{OP}: complex product trees diverged");
+            let mut next_real = Vec::with_capacity(real.len().div_ceil(2));
+            let mut next_imag = Vec::with_capacity(imag.len().div_ceil(2));
+            let mut real_iter = real.into_iter();
+            let mut imag_iter = imag.into_iter();
+
+            while let (Some(xr), Some(xi)) = (real_iter.next(), imag_iter.next()) {
+                match (real_iter.next(), imag_iter.next()) {
+                    (Some(yr), Some(yi)) => {
+                        let budget_r = xr.log_budget().min(yr.log_budget());
+                        let consumed_r = xr.log_delta().max(yr.log_delta());
+                        let budget_i = xi.log_budget().min(yi.log_budget());
+                        let consumed_i = xi.log_delta().max(yi.log_delta());
+                        ckks_ensure!(
+                            budget_r >= consumed_r && budget_i >= consumed_i,
+                            "{OP}: product tree exhausts the budget"
+                        );
+                        let k_dst_r = budget_r - consumed_r + xr.log_delta().min(yr.log_delta());
+                        let k_dst_i = budget_i - consumed_i + xi.log_delta().min(yi.log_delta());
+                        ckks_ensure!(k_dst_r == k_dst_i, "{OP}: complex product tree precisions diverged");
+
+                        let mut dst_r = module.ckks_ciphertext_alloc(b2k_t, TorusPrecision(k_dst_r as u32));
+                        let mut dst_i = module.ckks_ciphertext_alloc(b2k_t, TorusPrecision(k_dst_i as u32));
+                        module.ckks_mul_into_dual(&mut dst_r, &xr, &yr, &mut dst_i, &xi, &yi, keys.tensor_key(), scratch)?;
+                        next_real.push(dst_r);
+                        next_imag.push(dst_i);
+                    }
+                    (None, None) => {
+                        next_real.push(xr);
+                        next_imag.push(xi);
+                    }
+                    _ => return Err(anyhow::anyhow!("{OP}: complex product tree pairing diverged").into()),
+                }
+            }
+            ckks_ensure!(
+                real_iter.next().is_none() && imag_iter.next().is_none(),
+                "{OP}: complex product trees diverged"
+            );
+            real = next_real;
+            imag = next_imag;
+        }
+        vec![
+            real.pop().expect("real product tree is never empty"),
+            imag.pop().expect("imag product tree is never empty"),
+        ]
+    } else {
+        let mut level = leaves.pop().expect("real product leaves exist");
         while level.len() > 1 {
             let mut next = Vec::with_capacity(level.len().div_ceil(2));
             let mut iter = level.into_iter();
@@ -287,8 +298,8 @@ where
             }
             level = next;
         }
-        roots.push(level.pop().expect("product tree is never empty"));
-    }
+        vec![level.pop().expect("product tree is never empty")]
+    };
     Ok(roots)
 }
 

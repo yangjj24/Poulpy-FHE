@@ -138,6 +138,37 @@ pub unsafe trait GLWETensoringImpl<BE: Backend>: Backend {
         R: GLWEInfos,
         A: GLWEInfos,
         B: GGLWEInfos;
+
+    /// Default dual fallback: size and execute the two relinearizations
+    /// sequentially. Backends using `impl_glwe_tensoring_default!` override this
+    /// with the shared GGLWE/VMP path.
+    fn glwe_tensor_relinearize_dual_tmp_bytes<R, A, B>(module: &Module<BE>, res0: &R, res1: &R, a0: &A, a1: &A, tsk: &B) -> usize
+    where
+        R: GLWEInfos,
+        A: GLWEInfos,
+        B: GGLWEInfos,
+    {
+        Self::glwe_tensor_relinearize_tmp_bytes(module, res0, a0, tsk)
+            .max(Self::glwe_tensor_relinearize_tmp_bytes(module, res1, a1, tsk))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn glwe_tensor_relinearize_dual<R, A, H>(
+        module: &Module<BE>,
+        res0: &mut R,
+        res1: &mut R,
+        a0: &A,
+        a1: &A,
+        tsk: &H,
+        scratch: &mut ScratchArena<'_, BE>,
+    ) where
+        R: GLWEToBackendMut<BE> + GLWEInfos,
+        A: GLWEToBackendRef<BE> + GLWEInfos,
+        H: GetTensorKey<BE>,
+    {
+        Self::glwe_tensor_relinearize(module, res0, a0, tsk, &mut scratch.borrow());
+        Self::glwe_tensor_relinearize(module, res1, a1, tsk, &mut scratch.borrow());
+    }
 }
 
 /// Backend-provided GLWE addition operations.
@@ -549,6 +580,42 @@ macro_rules! impl_glwe_tensoring_default {
             {
                 <::poulpy_hal::layouts::Module<$be> as $crate::default::operations::GLWETensoringDefault<$be>>::glwe_tensor_relinearize_tmp_bytes_default(
                     module, res, a, tsk,
+                )
+            }
+
+            fn glwe_tensor_relinearize_dual_tmp_bytes<R, A, B>(
+                module: &::poulpy_hal::layouts::Module<$be>,
+                res0: &R,
+                res1: &R,
+                a0: &A,
+                a1: &A,
+                tsk: &B,
+            ) -> usize
+            where
+                R: $crate::layouts::GLWEInfos,
+                A: $crate::layouts::GLWEInfos,
+                B: $crate::layouts::GGLWEInfos,
+            {
+                <::poulpy_hal::layouts::Module<$be> as $crate::default::operations::GLWETensoringDefault<$be>>::glwe_tensor_relinearize_dual_tmp_bytes_default(
+                    module, res0, res1, a0, a1, tsk,
+                )
+            }
+
+            fn glwe_tensor_relinearize_dual<R, A, H>(
+                module: &::poulpy_hal::layouts::Module<$be>,
+                res0: &mut R,
+                res1: &mut R,
+                a0: &A,
+                a1: &A,
+                tsk: &H,
+                scratch: &mut ::poulpy_hal::layouts::ScratchArena<'_, $be>,
+            ) where
+                R: $crate::layouts::GLWEToBackendMut<$be> + $crate::layouts::GLWEInfos,
+                A: $crate::layouts::GLWEToBackendRef<$be> + $crate::layouts::GLWEInfos,
+                H: $crate::layouts::GetTensorKey<$be>,
+            {
+                <::poulpy_hal::layouts::Module<$be> as $crate::default::operations::GLWETensoringDefault<$be>>::glwe_tensor_relinearize_dual_default(
+                    module, res0, res1, a0, a1, tsk, scratch,
                 )
             }
         }

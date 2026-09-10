@@ -105,6 +105,18 @@ pub trait CKKSMulOps<BE: Backend> {
         B: CKKSCtBounds,
         T: GGLWEInfos;
 
+    /// Scratch bytes for two same-shape ciphertext multiplications whose
+    /// tensor-key relinearizations may be evaluated in lockstep. `res`, `a`,
+    /// and `b` describe either branch; both branches must have the same layout
+    /// and effective precision.
+    #[doc(hidden)]
+    fn ckks_mul_dual_tmp_bytes<R, A, B, T>(&self, res: &R, a: &A, b: &B, tsk: &T) -> usize
+    where
+        R: CKKSCtBounds,
+        A: CKKSCtBounds,
+        B: CKKSCtBounds,
+        T: GGLWEInfos;
+
     /// Scratch bytes for [`Self::ckks_square_into`] / [`Self::ckks_square_assign`]
     /// with result `res` and operand `a` (pass `dst` twice for `_assign`).
     fn ckks_square_tmp_bytes<R, A, T>(&self, res: &R, a: &A, tsk: &T) -> usize
@@ -130,6 +142,28 @@ pub trait CKKSMulOps<BE: Backend> {
     /// See the trait-level documentation for the exact metadata rule including
     /// the capacity offset.
     fn ckks_mul_into<Dst, A, B, H>(&self, dst: &mut Dst, a: &A, b: &B, tsk: &H, scratch: &mut ScratchArena<'_, BE>) -> Result<()>
+    where
+        Dst: GLWEToBackendMut<BE> + CKKSCtBounds + SetCKKSInfos,
+        A: GLWEToBackendRef<BE> + CKKSCtBounds,
+        B: GLWEToBackendRef<BE> + CKKSCtBounds,
+        H: GetTensorKey<BE>;
+
+    /// Computes two independent ciphertext products while allowing the backend
+    /// to share the common tensor/relinearization-key traversal. This does not
+    /// mix the two arithmetic paths.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    fn ckks_mul_into_dual<Dst, A, B, H>(
+        &self,
+        dst0: &mut Dst,
+        a0: &A,
+        b0: &B,
+        dst1: &mut Dst,
+        a1: &A,
+        b1: &B,
+        tsk: &H,
+        scratch: &mut ScratchArena<'_, BE>,
+    ) -> Result<()>
     where
         Dst: GLWEToBackendMut<BE> + CKKSCtBounds + SetCKKSInfos,
         A: GLWEToBackendRef<BE> + CKKSCtBounds,

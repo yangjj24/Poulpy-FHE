@@ -149,6 +149,33 @@ pub trait GLWETensoring<BE: Backend> {
         R: GLWEInfos,
         A: GLWEInfos,
         B: GGLWEInfos;
+
+    /// Scratch bytes for relinearizing two same-shape tensor ciphertexts against
+    /// the same tensor key. Backends may fuse the shared key traversal.
+    #[doc(hidden)]
+    fn glwe_tensor_relinearize_dual_tmp_bytes<R, A, B>(&self, res0: &R, res1: &R, a0: &A, a1: &A, tsk: &B) -> usize
+    where
+        R: GLWEInfos,
+        A: GLWEInfos,
+        B: GGLWEInfos;
+
+    /// Relinearizes two independent tensor ciphertexts against one tensor key.
+    /// The two arithmetic results remain independent; only key/data traversal
+    /// may be shared by the backend.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    fn glwe_tensor_relinearize_dual<R, A, H>(
+        &self,
+        res0: &mut R,
+        res1: &mut R,
+        a0: &A,
+        a1: &A,
+        tsk: &H,
+        scratch: &mut ScratchArena<'_, BE>,
+    ) where
+        R: GLWEToBackendMut<BE> + GLWEInfos,
+        A: GLWEToBackendRef<BE> + GLWEInfos,
+        H: GetTensorKey<BE>;
 }
 
 pub trait GLWEAdd<BE: Backend> {

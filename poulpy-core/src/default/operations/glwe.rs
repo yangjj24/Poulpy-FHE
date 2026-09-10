@@ -472,8 +472,32 @@ pub trait GLWETensoringDefault<BE: Backend> {
         A: GLWEInfos,
         B: GGLWEInfos;
 
+    /// Scratch bound for relinearizing two tensors against the same tensor key.
+    /// The two gadget products are evaluated through the dual GGLWE/VMP path.
+    fn glwe_tensor_relinearize_dual_tmp_bytes_default<R, A, B>(&self, res0: &R, res1: &R, a0: &A, a1: &A, tsk: &B) -> usize
+    where
+        R: GLWEInfos,
+        A: GLWEInfos,
+        B: GGLWEInfos;
+
     fn glwe_tensor_relinearize_default<R, A, H>(&self, res: &mut R, a: &A, tsk: &H, scratch: &mut ScratchArena<'_, BE>)
     where
+        R: GLWEToBackendMut<BE> + GLWEInfos,
+        A: GLWEToBackendRef<BE> + GLWEInfos,
+        H: GetTensorKey<BE>;
+
+    /// Relinearizes two independent tensor ciphertexts using one shared tensor
+    /// key traversal. No arithmetic is mixed between the two outputs.
+    #[allow(clippy::too_many_arguments)]
+    fn glwe_tensor_relinearize_dual_default<R, A, H>(
+        &self,
+        res0: &mut R,
+        res1: &mut R,
+        a0: &A,
+        a1: &A,
+        tsk: &H,
+        scratch: &mut ScratchArena<'_, BE>,
+    ) where
         R: GLWEToBackendMut<BE> + GLWEInfos,
         A: GLWEToBackendRef<BE> + GLWEInfos,
         H: GetTensorKey<BE>;
@@ -644,6 +668,59 @@ where
         lvl_0 + lvl_1
     }
 
+    fn glwe_tensor_relinearize_dual_tmp_bytes_default<R, A, B>(&self, res0: &R, res1: &R, a0: &A, a1: &A, tsk: &B) -> usize
+    where
+        R: GLWEInfos,
+        A: GLWEInfos,
+        B: GGLWEInfos,
+    {
+        assert_eq!(self.n() as u32, res0.n());
+        assert_eq!(self.n() as u32, a0.n());
+        assert_eq!(res0.n(), res1.n());
+        assert_eq!(a0.n(), a1.n());
+        assert_eq!(res0.base2k(), res1.base2k());
+        assert_eq!(a0.base2k(), a1.base2k());
+        assert_eq!(a0.k(), a1.k());
+        assert_eq!(res0.rank(), res1.rank());
+        assert_eq!(a0.rank(), a1.rank());
+        assert_eq!(self.n() as u32, tsk.n());
+
+        let a_base2k: usize = a0.base2k().into();
+        let key_base2k: usize = tsk.base2k().into();
+        let res_base2k: usize = res0.base2k().into();
+        let cols: usize = tsk.rank_out().as_usize() + 1;
+        let pairs: usize = tsk.rank_in().as_usize();
+        let a_dft_size: usize = a0.k().div_ceil(tsk.base2k()) as usize;
+        let output_size0 = gglwe_product_output_size::<BE, _, _, _>(res0, a0, tsk);
+        let output_size1 = gglwe_product_output_size::<BE, _, _, _>(res1, a1, tsk);
+        assert_eq!(output_size0, output_size1, "dual tensor relinearization output sizes differ");
+        let output_size = output_size0;
+
+        // Both transformed tensor tails must remain live through the shared
+        // gadget product. Conversion work itself is reused sequentially.
+        let lvl_0 = 2 * self.bytes_of_vec_znx_dft(pairs, a_dft_size);
+        let lvl_1_pre_conv = if a_base2k != key_base2k {
+            BE::bytes_of_vec_znx(self.n(), 1, a_dft_size) + self.vec_znx_normalize_tmp_bytes()
+        } else {
+            0
+        };
+        let lvl_1_res_dft = 2 * self.bytes_of_vec_znx_dft(cols, output_size);
+        let lvl_1_gglwe_product = self.gglwe_product_dft_dual_tmp_bytes_default(output_size, a_dft_size, tsk);
+        let lvl_1_post_conv = if res_base2k != key_base2k {
+            BE::bytes_of_vec_znx(self.n(), 1, a_dft_size) + self.vec_znx_normalize_tmp_bytes()
+        } else {
+            0
+        };
+        // The two outputs are finalized sequentially, so one VecZnxBig and one
+        // normalization workspace are sufficient.
+        let lvl_1_big_norm = self.bytes_of_vec_znx_big(cols, output_size)
+            + BE::bytes_of_vec_znx(self.n(), 1, res0.size().max(res1.size()))
+            + self.vec_znx_big_normalize_tmp_bytes();
+        let lvl_1_main = lvl_1_res_dft + lvl_1_gglwe_product.max(lvl_1_post_conv).max(lvl_1_big_norm);
+
+        lvl_0 + lvl_1_pre_conv.max(lvl_1_main)
+    }
+
     fn glwe_tensor_relinearize_default<R, A, H>(&self, res: &mut R, a: &A, tsk: &H, scratch: &mut ScratchArena<'_, BE>)
     where
         R: GLWEToBackendMut<BE> + GLWEInfos,
@@ -752,6 +829,208 @@ where
                 i,
                 &mut scratch_iter,
             );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn glwe_tensor_relinearize_dual_default<R, A, H>(
+        &self,
+        res0: &mut R,
+        res1: &mut R,
+        a0: &A,
+        a1: &A,
+        tsk: &H,
+        scratch: &mut ScratchArena<'_, BE>,
+    ) where
+        R: GLWEToBackendMut<BE> + GLWEInfos,
+        A: GLWEToBackendRef<BE> + GLWEInfos,
+        H: GetTensorKey<BE>,
+    {
+        assert_eq!(a0.k(), a1.k(), "dual tensor operands have different precision");
+        let tsk = &tsk.get_tensor_key(a0.k()).unwrap_or_else(|e| panic!("{e}"));
+        let scratch = scratch.borrow();
+        let needed = self.glwe_tensor_relinearize_dual_tmp_bytes_default(res0, res1, a0, a1, tsk);
+        assert!(
+            scratch.available() >= needed,
+            "scratch.available(): {} < GLWETensoringDefault::glwe_tensor_relinearize_dual_tmp_bytes: {}",
+            scratch.available(),
+            needed
+        );
+
+        let a_base2k: usize = a0.base2k().into();
+        let key_base2k: usize = tsk.base2k().into();
+        let res_base2k: usize = res0.base2k().into();
+        let res_k = res0.k().as_usize();
+        assert_eq!(self.n() as u32, res0.n());
+        assert_eq!(self.n() as u32, a0.n());
+        assert_eq!(res0.n(), res1.n());
+        assert_eq!(a0.n(), a1.n());
+        assert_eq!(res0.base2k(), res1.base2k());
+        assert_eq!(res0.k(), res1.k());
+        assert_eq!(res0.rank(), res1.rank());
+        assert_eq!(a0.base2k(), a1.base2k());
+        assert_eq!(a0.rank(), a1.rank());
+        assert_eq!(res0.rank(), tsk.rank_out());
+        assert_eq!(a0.rank(), tsk.rank_out());
+
+        let cols: usize = tsk.rank_out().as_usize() + 1;
+        let pairs: usize = tsk.rank_in().as_usize();
+        let a_dft_size: usize = a0.k().div_ceil(tsk.base2k()) as usize;
+        let output_size0 = gglwe_product_output_size::<BE, _, _, _>(res0, a0, tsk);
+        let output_size1 = gglwe_product_output_size::<BE, _, _, _>(res1, a1, tsk);
+        assert_eq!(output_size0, output_size1, "dual tensor relinearization output sizes differ");
+        let output_size = output_size0;
+
+        let a0_backend = a0.to_backend_ref();
+        let a1_backend = a1.to_backend_ref();
+        let (mut a0_dft, scratch_1) = scratch.take_vec_znx_dft_scratch(self, pairs, a_dft_size);
+        let (mut a1_dft, mut scratch_2) = scratch_1.take_vec_znx_dft_scratch(self, pairs, a_dft_size);
+
+        if a_base2k == key_base2k {
+            for i in 0..pairs {
+                self.vec_znx_dft_apply(1, 0, &mut a0_dft, i, &a0_backend.data, cols + i);
+                self.vec_znx_dft_apply(1, 0, &mut a1_dft, i, &a1_backend.data, cols + i);
+            }
+        } else {
+            let (mut a_conv, mut scratch_norm) = scratch_2.borrow().take_vec_znx_scratch(self.n(), 1, a_dft_size);
+            for i in 0..pairs {
+                self.vec_znx_normalize(
+                    &mut a_conv,
+                    key_base2k,
+                    a_dft_size * key_base2k,
+                    0,
+                    0,
+                    &a0_backend.data,
+                    a_base2k,
+                    cols + i,
+                    &mut scratch_norm.borrow(),
+                );
+                self.vec_znx_dft_apply(1, 0, &mut a0_dft, i, &a_conv.to_backend_ref(), 0);
+                self.vec_znx_normalize(
+                    &mut a_conv,
+                    key_base2k,
+                    a_dft_size * key_base2k,
+                    0,
+                    0,
+                    &a1_backend.data,
+                    a_base2k,
+                    cols + i,
+                    &mut scratch_norm.borrow(),
+                );
+                self.vec_znx_dft_apply(1, 0, &mut a1_dft, i, &a_conv.to_backend_ref(), 0);
+            }
+        }
+
+        let (mut res0_dft, scratch_3) = scratch_2.take_vec_znx_dft_scratch(self, cols, output_size);
+        let (mut res1_dft, mut work) = scratch_3.take_vec_znx_dft_scratch(self, cols, output_size);
+        {
+            let mut res0_dft_backend = res0_dft.to_backend_mut();
+            let mut res1_dft_backend = res1_dft.to_backend_mut();
+            self.gglwe_product_dft_dual_default(
+                &mut res0_dft_backend,
+                &mut res1_dft_backend,
+                &a0_dft.to_backend_ref(),
+                &a1_dft.to_backend_ref(),
+                &tsk.0,
+                1,
+                &mut work.borrow(),
+            );
+        }
+
+        // Finalize real/first branch.
+        {
+            let (mut res_big, mut scratch_3) = work.borrow().take_vec_znx_big_scratch(self, cols, output_size);
+            {
+                let mut res_big_backend = res_big.to_backend_mut();
+                let mut res_dft_backend = res0_dft.to_backend_mut();
+                for i in 0..cols {
+                    self.vec_znx_idft_apply_tmpa(&mut res_big_backend, i, &mut res_dft_backend, i);
+                }
+            }
+            if a_base2k == key_base2k {
+                for i in 0..cols {
+                    self.vec_znx_big_add_small_assign(&mut res_big, i, &a0_backend.data, i);
+                }
+            } else {
+                let (mut a_conv, mut scratch_norm) = scratch_3.borrow().take_vec_znx_scratch(self.n(), 1, a_dft_size);
+                for i in 0..cols {
+                    self.vec_znx_normalize(
+                        &mut a_conv,
+                        key_base2k,
+                        a_dft_size * key_base2k,
+                        0,
+                        0,
+                        &a0_backend.data,
+                        a_base2k,
+                        i,
+                        &mut scratch_norm.borrow(),
+                    );
+                    self.vec_znx_big_add_small_assign(&mut res_big, i, &a_conv.to_backend_ref(), 0);
+                }
+            }
+            let res_big_ref = res_big.to_backend_ref();
+            let mut res_backend = res0.to_backend_mut();
+            for i in 0..cols {
+                self.vec_znx_big_normalize(
+                    &mut res_backend.data,
+                    res_base2k,
+                    res_k,
+                    0,
+                    i,
+                    &res_big_ref,
+                    key_base2k,
+                    i,
+                    &mut scratch_3.borrow(),
+                );
+            }
+        }
+
+        // Finalize imaginary/second branch, reusing the same Big/normalize area.
+        {
+            let (mut res_big, mut scratch_3) = work.borrow().take_vec_znx_big_scratch(self, cols, output_size);
+            {
+                let mut res_big_backend = res_big.to_backend_mut();
+                let mut res_dft_backend = res1_dft.to_backend_mut();
+                for i in 0..cols {
+                    self.vec_znx_idft_apply_tmpa(&mut res_big_backend, i, &mut res_dft_backend, i);
+                }
+            }
+            if a_base2k == key_base2k {
+                for i in 0..cols {
+                    self.vec_znx_big_add_small_assign(&mut res_big, i, &a1_backend.data, i);
+                }
+            } else {
+                let (mut a_conv, mut scratch_norm) = scratch_3.borrow().take_vec_znx_scratch(self.n(), 1, a_dft_size);
+                for i in 0..cols {
+                    self.vec_znx_normalize(
+                        &mut a_conv,
+                        key_base2k,
+                        a_dft_size * key_base2k,
+                        0,
+                        0,
+                        &a1_backend.data,
+                        a_base2k,
+                        i,
+                        &mut scratch_norm.borrow(),
+                    );
+                    self.vec_znx_big_add_small_assign(&mut res_big, i, &a_conv.to_backend_ref(), 0);
+                }
+            }
+            let res_big_ref = res_big.to_backend_ref();
+            let mut res_backend = res1.to_backend_mut();
+            for i in 0..cols {
+                self.vec_znx_big_normalize(
+                    &mut res_backend.data,
+                    res_base2k,
+                    res_k,
+                    0,
+                    i,
+                    &res_big_ref,
+                    key_base2k,
+                    i,
+                    &mut scratch_3.borrow(),
+                );
+            }
         }
     }
 

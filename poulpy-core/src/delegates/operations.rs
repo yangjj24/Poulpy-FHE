@@ -250,6 +250,29 @@ impl_operations_delegate!(
         B: GGLWEInfos,
     {
         BE::glwe_tensor_relinearize_tmp_bytes(self, res, a, tsk)
+    },
+    fn glwe_tensor_relinearize_dual_tmp_bytes<R, A, B>(&self, res0: &R, res1: &R, a0: &A, a1: &A, tsk: &B) -> usize
+    where
+        R: GLWEInfos,
+        A: GLWEInfos,
+        B: GGLWEInfos,
+    {
+        BE::glwe_tensor_relinearize_dual_tmp_bytes(self, res0, res1, a0, a1, tsk)
+    },
+    fn glwe_tensor_relinearize_dual<R, A, H>(
+        &self,
+        res0: &mut R,
+        res1: &mut R,
+        a0: &A,
+        a1: &A,
+        tsk: &H,
+        scratch: &mut ScratchArena<'_, BE>,
+    ) where
+        R: GLWEToBackendMut<BE> + GLWEInfos,
+        A: GLWEToBackendRef<BE> + GLWEInfos,
+        H: GetTensorKey<BE>,
+    {
+        BE::glwe_tensor_relinearize_dual(self, res0, res1, a0, a1, tsk, scratch)
     }
 );
 
