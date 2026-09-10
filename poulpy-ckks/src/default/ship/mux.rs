@@ -353,3 +353,107 @@ where
     }
     Ok(())
 }
+
+/// Logical-to-physical routing for the experimental sheared SHIP layout.
+///
+/// Layout invariant (slot domain):
+///     Y_g[p] = x_{p mod G}[(p + g) mod n].
+///
+/// A common logical rotation by `t` is obtained from one source group and a
+/// physical rotation that is always a multiple of `G`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ShipShearedRoute {
+    pub(crate) group: usize,
+    pub(crate) physical_rot: usize,
+}
+
+#[inline]
+pub(crate) fn ship_sheared_branch(p: usize, groups: usize) -> usize {
+    debug_assert!(groups != 0);
+    p % groups
+}
+
+#[inline]
+pub(crate) fn ship_sheared_logical_index(p: usize, group: usize, slots: usize) -> usize {
+    debug_assert!(slots != 0);
+    (p + group) % slots
+}
+
+/// Route an output group and a non-negative logical rotation to its source.
+#[inline]
+pub(crate) fn ship_sheared_route_from_output(out: usize, logical_rot: usize, groups: usize) -> ShipShearedRoute {
+    debug_assert!(groups != 0 && out < groups);
+    let src = (out + logical_rot) % groups;
+    let physical_rot = out + logical_rot - src;
+    debug_assert_eq!(physical_rot % groups, 0);
+    ShipShearedRoute {
+        group: src,
+        physical_rot,
+    }
+}
+
+/// Source-major form of [`ship_sheared_route_from_output`].
+#[inline]
+pub(crate) fn ship_sheared_route_from_source(src: usize, logical_rot: usize, groups: usize) -> ShipShearedRoute {
+    debug_assert!(groups != 0 && src < groups);
+    let out = (src + groups - (logical_rot % groups)) % groups;
+    let physical_rot = out + logical_rot - src;
+    debug_assert_eq!(physical_rot % groups, 0);
+    ShipShearedRoute {
+        group: out,
+        physical_rot,
+    }
+}
+
+#[cfg(test)]
+mod sheared_layout_tests {
+    use super::{
+        ship_sheared_branch, ship_sheared_logical_index, ship_sheared_route_from_output, ship_sheared_route_from_source,
+    };
+
+    #[test]
+    fn sheared_layout_keeps_branch_in_fixed_residue_lane() {
+        for groups in [2usize, 4, 8, 32] {
+            let slots = groups * 8;
+            for g in 0..groups {
+                for p in 0..slots {
+                    assert_eq!(ship_sheared_branch(p, groups), p % groups);
+                    assert_eq!(ship_sheared_logical_index(p, g, slots), (p + g) % slots);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sheared_route_from_output_matches_logical_rotation() {
+        for groups in [2usize, 4, 8, 32] {
+            let slots = groups * 8;
+            for out in 0..groups {
+                for logical_rot in 0..slots {
+                    let route = ship_sheared_route_from_output(out, logical_rot, groups);
+                    assert_eq!(route.physical_rot % groups, 0);
+                    for p in 0..slots {
+                        let routed_index = (p + route.physical_rot + route.group) % slots;
+                        let expected_index = (p + out + logical_rot) % slots;
+                        assert_eq!(routed_index, expected_index);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sheared_source_and_output_routes_are_inverses() {
+        for groups in [2usize, 4, 8, 32] {
+            let slots = groups * 8;
+            for src in 0..groups {
+                for logical_rot in 0..slots {
+                    let forward = ship_sheared_route_from_source(src, logical_rot, groups);
+                    let backward = ship_sheared_route_from_output(forward.group, logical_rot, groups);
+                    assert_eq!(backward.group, src);
+                    assert_eq!(backward.physical_rot, forward.physical_rot);
+                }
+            }
+        }
+    }
+}
