@@ -111,7 +111,7 @@ pub struct HMuxRotKeyPrepared<D: Data, BE: Backend> {
 pub struct ShipIndexKeys<D: Data, W: ZnxWord> {
     pub(crate) mux_keys: Vec<Vec<HMuxRotKey<D, W>>>,
     pub(crate) masks: Vec<CKKSCiphertext<D, W>>,
-    pub(crate) masks2: Vec<CKKSCiphertext<D, W>>,
+    // pub(crate) masks2: Vec<CKKSCiphertext<D, W>>,
 }
 
 /// Prepared form of [`ShipIndexKeys`]: the masks become left convolution
@@ -119,7 +119,7 @@ pub struct ShipIndexKeys<D: Data, W: ZnxWord> {
 pub struct ShipIndexKeysPrepared<D: Data, BE: Backend> {
     pub(crate) mux_keys: Vec<Vec<HMuxRotKeyPrepared<D, BE>>>,
     pub(crate) masks: Vec<CnvPVecL<D, BE::DftWord, BE>>,
-    pub(crate) masks2: Vec<CnvPVecL<D, BE::DftWord, BE>>,
+    // pub(crate) masks2: Vec<CnvPVecL<D, BE::DftWord, BE>>,
 }
 
 impl<D: Data, BE: Backend> ShipIndexKeysPrepared<D, BE> {
@@ -133,11 +133,11 @@ impl<D: Data, BE: Backend> ShipIndexKeysPrepared<D, BE> {
         &self.masks
     }
 
-    /// The `omega_2` mask set (second coefficient half), empty unless the
-    /// keys were generated with `complex`.
-    pub fn masks2(&self) -> &[CnvPVecL<D, BE::DftWord, BE>] {
-        &self.masks2
-    }
+    // The `omega_2` mask set (second coefficient half), empty unless the
+    // keys were generated with `complex`.
+    // pub fn masks2(&self) -> &[CnvPVecL<D, BE::DftWord, BE>] {
+    //     &self.masks2
+    // }
 }
 
 /// Validated, unprepared SHIP key material.
@@ -286,7 +286,7 @@ impl<D: Data, W: ZnxWord> ShipKeySet<D, W> {
         let mut index_keys = Vec::with_capacity(self.index_keys.len());
         for ik in &self.index_keys {
             let masks = prepare_masks(&ik.masks, scratch);
-            let masks2 = prepare_masks(&ik.masks2, scratch);
+            // let masks2 = prepare_masks(&ik.masks2, scratch);
             let mux_keys = ik
                 .mux_keys
                 .iter()
@@ -301,7 +301,8 @@ impl<D: Data, W: ZnxWord> ShipKeySet<D, W> {
                         .collect()
                 })
                 .collect();
-            index_keys.push(ShipIndexKeysPrepared { mux_keys, masks, masks2 });
+            // index_keys.push(ShipIndexKeysPrepared { mux_keys, masks, masks2 });
+            index_keys.push(ShipIndexKeysPrepared { mux_keys, masks });
         }
 
         let mut dense_to_sparse = module.glwe_switching_key_prepared_alloc_from_infos(&self.dense_to_sparse);
@@ -515,7 +516,7 @@ impl<D: Data> ShipKeySet<D, i64> {
                     .collect()
             };
             let masks = encrypt_masks(false)?;
-            let masks2 = if layout.complex { encrypt_masks(true)? } else { Vec::new() };
+            // let masks2 = if layout.complex { encrypt_masks(true)? } else { Vec::new() };
 
             let mut mux_keys = Vec::with_capacity(bases.len());
             let mut weight = theta;
@@ -540,7 +541,8 @@ impl<D: Data> ShipKeySet<D, i64> {
                 mux_keys.push(group);
                 weight *= b;
             }
-            index_keys.push(ShipIndexKeys { mux_keys, masks, masks2 });
+            // index_keys.push(ShipIndexKeys { mux_keys, masks, masks2 });
+            index_keys.push(ShipIndexKeys { mux_keys, masks });
         }
 
         // Dense -> sparse encapsulation key at the bottom modulus: the only
@@ -616,13 +618,14 @@ fn validate_material<D: Data, W: ZnxWord>(
             "SHIP index {slot} has {} masks, expected {mask_count}",
             ik.masks.len()
         );
-        let expected2 = if parameters.complex { mask_count } else { 0 };
-        ensure!(
-            ik.masks2.len() == expected2,
-            "SHIP index {slot} has {} omega_2 masks, expected {expected2}",
-            ik.masks2.len()
-        );
-        for ct in ik.masks.iter().chain(&ik.masks2) {
+        // let expected2 = if parameters.complex { mask_count } else { 0 };
+        // ensure!(
+        //     ik.masks2.len() == expected2,
+        //     "SHIP index {slot} has {} omega_2 masks, expected {expected2}",
+        //     ik.masks2.len()
+        // );
+        // for ct in ik.masks.iter().chain(&ik.masks2) {
+        for ct in &ik.masks {
             ensure!(
                 ct.n().as_usize() == n
                     && ct.rank().as_usize() == 1

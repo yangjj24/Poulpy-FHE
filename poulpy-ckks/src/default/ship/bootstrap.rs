@@ -181,13 +181,38 @@ where
     for (slot, ik) in keys.index_keys().iter().enumerate() {
         let pi = &enc.pi[slot];
         ckks_ensure!(pi.len() == 4 * theta, "{OP}: malformed pi encodings at slot {slot}");
+        // for (half, half_leaves) in leaves.iter_mut().enumerate() {
+        //     let masks = if half == 0 { ik.masks() } else { ik.masks2() };
+        //     let mut acc = module.ckks_ciphertext_alloc(b2k_t, TorusPrecision(kk as u32));
+        //     ship_masking_accumulate(module, &mut acc, &plan, masks, pi, scratch)?;
+        //     for group in ik.mux_keys() {
+        //         ship_mux_rotate(module, &mut acc, group, &plans, scratch)?;
+        //     }
+        //     half_leaves.push(acc);
+        // }
         for (half, half_leaves) in leaves.iter_mut().enumerate() {
-            let masks = if half == 0 { ik.masks() } else { ik.masks2() };
+            let band_order = if half == 0 {
+                // omega_1:
+                // M1*pi1 + M2*pi2 + M3*pi3 + M4*pi4
+                [0, 1, 2, 3]
+            } else {
+                // omega_2 masks satisfy
+                // [M2_1, M2_2, M2_3, M2_4] = [M4, M3, M1, M2].
+                //
+                // Therefore:
+                // M2_1*pi1 + M2_2*pi2 + M2_3*pi3 + M2_4*pi4
+                // = M1*pi3 + M2*pi4 + M3*pi2 + M4*pi1.
+                [2, 3, 1, 0]
+            };
+
             let mut acc = module.ckks_ciphertext_alloc(b2k_t, TorusPrecision(kk as u32));
-            ship_masking_accumulate(module, &mut acc, &plan, masks, pi, scratch)?;
+
+            ship_masking_accumulate(module, &mut acc, &plan, ik.masks(), pi, band_order, scratch)?;
+
             for group in ik.mux_keys() {
                 ship_mux_rotate(module, &mut acc, group, &plans, scratch)?;
             }
+
             half_leaves.push(acc);
         }
     }

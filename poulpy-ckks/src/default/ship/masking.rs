@@ -49,6 +49,7 @@ pub(crate) fn ship_masking_accumulate<BE>(
     plan: &ShipPlan,
     masks: &[CnvPVecL<BE::OwnedBuf, BE::DftWord, BE>],
     pis: &[CKKSPlaintextOwned<BE>],
+    band_order: [usize; 4],
     scratch: &mut ScratchArena<'_, BE>,
 ) -> Result<()>
 where
@@ -88,14 +89,32 @@ where
 
     let mut preps = Vec::with_capacity(pis.len());
     let mut rest = scratch_1;
-    for (mask, pi) in masks.iter().zip(pis) {
+    // for (mask, pi) in masks.iter().zip(pis) {
+    //     ckks_ensure!(
+    //         mask.size() == a_size && pi.size() == b_size,
+    //         "{OP}: inconsistent operand sizes"
+    //     );
+    //     let (mut b_prep, next) = rest.take_cnv_pvec_right_scratch(module, 1, b_size);
+    //     rest = next
+    //         .apply_mut(|s| module.cnv_prepare_right(&mut b_prep, GLWEToBackendRef::<BE>::to_backend_ref(pi).data(), b_mask, s));
+    //     preps.push(b_prep);
+    // }
+    for (i, mask) in masks.iter().enumerate() {
+        let candidate_base = (i / 4) * 4;
+        let band = i % 4;
+        let pi_idx = candidate_base + band_order[band];
+        let pi = &pis[pi_idx];
+
         ckks_ensure!(
             mask.size() == a_size && pi.size() == b_size,
             "{OP}: inconsistent operand sizes"
         );
+
         let (mut b_prep, next) = rest.take_cnv_pvec_right_scratch(module, 1, b_size);
+
         rest = next
             .apply_mut(|s| module.cnv_prepare_right(&mut b_prep, GLWEToBackendRef::<BE>::to_backend_ref(pi).data(), b_mask, s));
+
         preps.push(b_prep);
     }
 

@@ -100,4 +100,21 @@ mod tests {
         assert_eq!(ship_pre_rotated_masks_omega2(3, 1, m), ship_pre_rotated_masks(19, -1, m));
         assert_eq!(ship_pre_rotated_masks_omega2(19, 1, m), ship_pre_rotated_masks(3, 1, m));
     }
+
+    #[test]
+    fn omega2_is_fixed_permutation_of_omega1() {
+        for m in [8usize, 16, 32] {
+            for j in 0..2 * m {
+                for s_j in [-1i64, 1i64] {
+                    let masks = ship_pre_rotated_masks(j, s_j, m);
+                    let masks2 = ship_pre_rotated_masks_omega2(j, s_j, m);
+
+                    assert_eq!(masks2[0], masks[3], "m={m}, j={j}, s={s_j}: M2[0] != M[3]");
+                    assert_eq!(masks2[1], masks[2], "m={m}, j={j}, s={s_j}: M2[1] != M[2]");
+                    assert_eq!(masks2[2], masks[0], "m={m}, j={j}, s={s_j}: M2[2] != M[0]");
+                    assert_eq!(masks2[3], masks[1], "m={m}, j={j}, s={s_j}: M2[3] != M[1]");
+                }
+            }
+        }
+    }
 }
