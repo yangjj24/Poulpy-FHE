@@ -36,8 +36,11 @@ where
     let work = module
         .cnv_prepare_right_tmp_bytes(b_size, b_size)
         .max(module.cnv_accumulate_dft_tmp_bytes(0, res_dft_size, a_size, b_size))
+        .max(module.cnv_accumulate_dft_dual_tmp_bytes(0, res_dft_size, a_size, b_size))
         .max(module.bytes_of_vec_znx_big(2, res_dft_size) + module.vec_znx_big_normalize_tmp_bytes());
-    module.bytes_of_vec_znx_dft(2, res_dft_size) + preps + work
+    // The complex path keeps both two-column DFT sums live together.
+    // The real-only path over-allocates this temporary by two columns.
+    module.bytes_of_vec_znx_dft(4, res_dft_size) + preps + work
 }
 
 /// Lazy masking accumulation: `acc = sum_i masks[i] * pis[i]` over the
@@ -267,7 +270,7 @@ where
      */
     let scratch = scratch.borrow();
 
-    let (mut sum_dft, scratch_1) = scratch.take_vec_znx_dft_scratch(module, 2, res_dft_size);
+    let (mut sum_dft, scratch_1) = scratch.take_vec_znx_dft_scratch(module, 4, res_dft_size);
 
     let mut rest = scratch_1;
 
@@ -299,90 +302,83 @@ where
     const BAND_ORDERS: [[usize; 4]; 2] = [[0, 1, 2, 3], [2, 3, 1, 0]];
 
     // ------------------------------------------------------------
-    // Phase B/C: reuse the same prepared RHS for the two outputs.
+    // Phase B: evaluate the real/imag convolution sums together.
     // ------------------------------------------------------------
+    {
+        let mut sum_dft_mut = sum_dft.to_backend_mut();
+        for col in 0..2 {
+            let terms_real: Vec<CnvDftAccTerm<'_, BE>> = masks
+                .iter()
+                .enumerate()
+                .map(|(i, mask)| {
+                    let candidate_base = (i / 4) * 4;
+                    let band = i % 4;
+                    let prep = &preps[candidate_base + BAND_ORDERS[0][band]];
+                    CnvDftAccTerm {
+                        a: mask.to_backend_ref(),
+                        a_col: col,
+                        b: prep.to_backend_ref(),
+                        b_col: 0,
+                    }
+                })
+                .collect();
+            let terms_imag: Vec<CnvDftAccTerm<'_, BE>> = masks
+                .iter()
+                .enumerate()
+                .map(|(i, mask)| {
+                    let candidate_base = (i / 4) * 4;
+                    let band = i % 4;
+                    let prep = &preps[candidate_base + BAND_ORDERS[1][band]];
+                    CnvDftAccTerm {
+                        a: mask.to_backend_ref(),
+                        a_col: col,
+                        b: prep.to_backend_ref(),
+                        b_col: 0,
+                    }
+                })
+                .collect();
+            module.cnv_accumulate_dft_dual(
+                cnv_offset_hi,
+                &mut sum_dft_mut,
+                col,
+                &terms_real,
+                col + 2,
+                &terms_imag,
+                &mut rest.borrow(),
+            );
+        }
+    }
 
+    // ------------------------------------------------------------
+    // Phase C: IDFT/normalize each half; res_big is reused.
+    // ------------------------------------------------------------
     for half in 0..2 {
-        let band_order = BAND_ORDERS[half];
-
-        // DFT-domain convolution accumulation.
-        //
-        // cnv_accumulate_dft overwrites sum_dft, so the same buffer can
-        // be reused for the two halves.
+        let src_base = 2 * half;
+        let (mut res_big, mut scratch_2) = rest.borrow().take_vec_znx_big_scratch(module, 2, res_dft_size);
         {
+            let mut res_big_mut = res_big.to_backend_mut();
             let mut sum_dft_mut = sum_dft.to_backend_mut();
-
             for col in 0..2 {
-                let terms: Vec<CnvDftAccTerm<'_, BE>> = masks
-                    .iter()
-                    .enumerate()
-                    .map(|(i, mask)| {
-                        let candidate_base = (i / 4) * 4;
-                        let band = i % 4;
-
-                        let prep_idx = candidate_base + band_order[band];
-
-                        let prep = &preps[prep_idx];
-
-                        CnvDftAccTerm {
-                            a: mask.to_backend_ref(),
-                            a_col: col,
-                            b: prep.to_backend_ref(),
-                            b_col: 0,
-                        }
-                    })
-                    .collect();
-
-                module.cnv_accumulate_dft(cnv_offset_hi, &mut sum_dft_mut, col, &terms, &mut rest.borrow());
+                module.vec_znx_idft_apply_tmpa(&mut res_big_mut, col, &mut sum_dft_mut, src_base + col);
             }
         }
-
-        /*
-         * IMPORTANT:
-         *
-         * res_big is carved from rest only inside this scope.
-         * It is released before the next half starts, so the next
-         * cnv_accumulate_dft again has access to the full work area.
-         *
-         * This is why we do NOT need extra scratch for the dual path.
-         */
-        {
-            let (mut res_big, mut scratch_2) = rest.borrow().take_vec_znx_big_scratch(module, 2, res_dft_size);
-
-            // IDFT the accumulated result.
-            {
-                let mut res_big_mut = res_big.to_backend_mut();
-                let mut sum_dft_mut = sum_dft.to_backend_mut();
-
-                for col in 0..2 {
-                    module.vec_znx_idft_apply_tmpa(&mut res_big_mut, col, &mut sum_dft_mut, col);
-                }
-            }
-
-            let acc: &mut CKKSCiphertextOwned<BE> = if half == 0 { &mut *acc_real } else { &mut *acc_imag };
-
-            acc.set_log_budget(res_log_budget);
-            acc.set_log_delta(res_log_delta);
-
-            let res_big_ref = res_big.to_backend_ref();
-
-            {
-                let mut acc_mut = acc.to_backend_mut();
-
-                for col in 0..2 {
-                    module.vec_znx_big_normalize(
-                        acc_mut.data_mut(),
-                        base2k,
-                        res_log_budget + res_log_delta,
-                        cnv_offset_lo,
-                        col,
-                        &res_big_ref,
-                        base2k,
-                        col,
-                        &mut scratch_2.borrow(),
-                    );
-                }
-            }
+        let acc: &mut CKKSCiphertextOwned<BE> = if half == 0 { &mut *acc_real } else { &mut *acc_imag };
+        acc.set_log_budget(res_log_budget);
+        acc.set_log_delta(res_log_delta);
+        let res_big_ref = res_big.to_backend_ref();
+        let mut acc_mut = acc.to_backend_mut();
+        for col in 0..2 {
+            module.vec_znx_big_normalize(
+                acc_mut.data_mut(),
+                base2k,
+                res_log_budget + res_log_delta,
+                cnv_offset_lo,
+                col,
+                &res_big_ref,
+                base2k,
+                col,
+                &mut scratch_2.borrow(),
+            );
         }
     }
 

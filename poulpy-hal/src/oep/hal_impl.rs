@@ -1281,6 +1281,34 @@ pub unsafe trait HalConvolutionImpl<BE: Backend>: Backend {
         }
     }
 
+    fn cnv_accumulate_dft_dual_tmp_bytes(
+        module: &Module<BE>,
+        cnv_offset: usize,
+        res_size: usize,
+        a_size: usize,
+        b_size: usize,
+    ) -> usize {
+        Self::cnv_accumulate_dft_tmp_bytes(module, cnv_offset, res_size, a_size, b_size)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cnv_accumulate_dft_dual<'a>(
+        module: &Module<BE>,
+        cnv_offset: usize,
+        res: &mut crate::layouts::VecZnxDftBackendMut<'_, BE>,
+        res_col_0: usize,
+        terms_0: &[crate::layouts::CnvDftAccTerm<'a, BE>],
+        res_col_1: usize,
+        terms_1: &[crate::layouts::CnvDftAccTerm<'a, BE>],
+        scratch: &mut ScratchArena<'_, BE>,
+    ) where
+        BE: HalVecZnxDftImpl<BE> + 'a,
+    {
+        debug_assert_ne!(res_col_0, res_col_1);
+        Self::cnv_accumulate_dft(module, cnv_offset, res, res_col_0, terms_0, scratch);
+        Self::cnv_accumulate_dft(module, cnv_offset, res, res_col_1, terms_1, scratch);
+    }
+
     fn cnv_pairwise_apply_dft_tmp_bytes(
         module: &Module<BE>,
         cnv_offset: usize,

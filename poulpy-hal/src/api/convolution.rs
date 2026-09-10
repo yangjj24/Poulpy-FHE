@@ -210,6 +210,25 @@ pub trait Convolution<BE: Backend> {
     ) where
         BE: 'a;
 
+    /// Returns scratch bytes required for [`cnv_accumulate_dft_dual`](Convolution::cnv_accumulate_dft_dual).
+    /// `a_size` and `b_size` are upper bounds over both term sets.
+    fn cnv_accumulate_dft_dual_tmp_bytes(&self, cnv_offset: usize, res_size: usize, a_size: usize, b_size: usize) -> usize;
+
+    /// Evaluates two convolution sums into distinct columns of the same DFT object.
+    /// Backends may fuse this operation to reuse common prepared operands.
+    #[allow(clippy::too_many_arguments)]
+    fn cnv_accumulate_dft_dual<'a>(
+        &self,
+        cnv_offset: usize,
+        res: &mut VecZnxDftBackendMut<'_, BE>,
+        res_col_0: usize,
+        terms_0: &[CnvDftAccTerm<'a, BE>],
+        res_col_1: usize,
+        terms_1: &[CnvDftAccTerm<'a, BE>],
+        scratch: &mut ScratchArena<'_, BE>,
+    ) where
+        BE: 'a;
+
     /// Returns scratch bytes required for [`cnv_pairwise_apply_dft`](Convolution::cnv_pairwise_apply_dft).
     fn cnv_pairwise_apply_dft_tmp_bytes(&self, cnv_offset: usize, res_size: usize, a_size: usize, b_size: usize) -> usize;
 

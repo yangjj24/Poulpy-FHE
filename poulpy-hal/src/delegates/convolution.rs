@@ -181,6 +181,25 @@ impl_convolution_delegate!(
     {
         <BE as HalConvolutionImpl<BE>>::cnv_accumulate_dft(self, cnv_offset, res, res_col, terms, scratch)
     },
+    fn cnv_accumulate_dft_dual_tmp_bytes(&self, cnv_offset: usize, res_size: usize, a_size: usize, b_size: usize) -> usize {
+        <BE as HalConvolutionImpl<BE>>::cnv_accumulate_dft_dual_tmp_bytes(self, cnv_offset, res_size, a_size, b_size)
+    },
+    fn cnv_accumulate_dft_dual<'a>(
+        &self,
+        cnv_offset: usize,
+        res: &mut VecZnxDftBackendMut<'_, BE>,
+        res_col_0: usize,
+        terms_0: &[CnvDftAccTerm<'a, BE>],
+        res_col_1: usize,
+        terms_1: &[CnvDftAccTerm<'a, BE>],
+        scratch: &mut ScratchArena<'_, BE>,
+    ) where
+        BE: 'a,
+    {
+        <BE as HalConvolutionImpl<BE>>::cnv_accumulate_dft_dual(
+            self, cnv_offset, res, res_col_0, terms_0, res_col_1, terms_1, scratch,
+        )
+    },
     fn cnv_pairwise_apply_dft_tmp_bytes(&self, cnv_offset: usize, res_size: usize, a_size: usize, b_size: usize) -> usize {
         <BE as HalConvolutionImpl<BE>>::cnv_pairwise_apply_dft_tmp_bytes(self, cnv_offset, res_size, a_size, b_size)
     },
