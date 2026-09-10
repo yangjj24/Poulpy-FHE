@@ -17,7 +17,8 @@ use poulpy_hal::{
 };
 
 use super::{
-    masking::ship_masking_accumulate,
+    // masking::ship_masking_accumulate,
+    masking::{ship_masking_accumulate, ship_masking_accumulate_dual},
     mux::{ship_mux_plans, ship_mux_rotate},
 };
 use crate::{
@@ -172,48 +173,98 @@ where
     // rotation over the remaining digits; the pi plaintexts and mux keys are
     // shared between the halves, the mask sets differ. The mux rotation
     // amounts recur across slots, so their automorphism plans are built once.
+
+    // Leaves 1..=h: theta-column masking followed by the hoisted
+    // base-B mux blind rotation.
+    //
+    // In the complex path, both coefficient halves share the same
+    // encrypted selector masks and the same canonical preparation of
+    // the pi plaintexts.  The omega_2 path differs only by the fixed
+    // per-quartet pi permutation [2, 3, 1, 0].
+    //
+    // H-MUX keys are also shared, although the two H-MUX evaluations
+    // are still executed independently here.
     let plans = ship_mux_plans(
         module,
         keys.index_keys()
             .iter()
             .flat_map(|ik| ik.mux_keys().iter().map(Vec::as_slice)),
     );
+    // for (slot, ik) in keys.index_keys().iter().enumerate() {
+    //     let pi = &enc.pi[slot];
+    //     ckks_ensure!(pi.len() == 4 * theta, "{OP}: malformed pi encodings at slot {slot}");
+    //     // for (half, half_leaves) in leaves.iter_mut().enumerate() {
+    //     //     let masks = if half == 0 { ik.masks() } else { ik.masks2() };
+    //     //     let mut acc = module.ckks_ciphertext_alloc(b2k_t, TorusPrecision(kk as u32));
+    //     //     ship_masking_accumulate(module, &mut acc, &plan, masks, pi, scratch)?;
+    //     //     for group in ik.mux_keys() {
+    //     //         ship_mux_rotate(module, &mut acc, group, &plans, scratch)?;
+    //     //     }
+    //     //     half_leaves.push(acc);
+    //     // }
+    //     for (half, half_leaves) in leaves.iter_mut().enumerate() {
+    //         let band_order = if half == 0 {
+    //             // omega_1:
+    //             // M1*pi1 + M2*pi2 + M3*pi3 + M4*pi4
+    //             [0, 1, 2, 3]
+    //         } else {
+    //             // omega_2 masks satisfy
+    //             // [M2_1, M2_2, M2_3, M2_4] = [M4, M3, M1, M2].
+    //             //
+    //             // Therefore:
+    //             // M2_1*pi1 + M2_2*pi2 + M2_3*pi3 + M2_4*pi4
+    //             // = M1*pi3 + M2*pi4 + M3*pi2 + M4*pi1.
+    //             [2, 3, 1, 0]
+    //         };
+
+    //         let mut acc = module.ckks_ciphertext_alloc(b2k_t, TorusPrecision(kk as u32));
+
+    //         ship_masking_accumulate(module, &mut acc, &plan, ik.masks(), pi, band_order, scratch)?;
+
+    //         for group in ik.mux_keys() {
+    //             ship_mux_rotate(module, &mut acc, group, &plans, scratch)?;
+    //         }
+
+    //         half_leaves.push(acc);
+    //     }
+    // }
+
     for (slot, ik) in keys.index_keys().iter().enumerate() {
         let pi = &enc.pi[slot];
-        ckks_ensure!(pi.len() == 4 * theta, "{OP}: malformed pi encodings at slot {slot}");
-        // for (half, half_leaves) in leaves.iter_mut().enumerate() {
-        //     let masks = if half == 0 { ik.masks() } else { ik.masks2() };
-        //     let mut acc = module.ckks_ciphertext_alloc(b2k_t, TorusPrecision(kk as u32));
-        //     ship_masking_accumulate(module, &mut acc, &plan, masks, pi, scratch)?;
-        //     for group in ik.mux_keys() {
-        //         ship_mux_rotate(module, &mut acc, group, &plans, scratch)?;
-        //     }
-        //     half_leaves.push(acc);
-        // }
-        for (half, half_leaves) in leaves.iter_mut().enumerate() {
-            let band_order = if half == 0 {
-                // omega_1:
-                // M1*pi1 + M2*pi2 + M3*pi3 + M4*pi4
-                [0, 1, 2, 3]
-            } else {
-                // omega_2 masks satisfy
-                // [M2_1, M2_2, M2_3, M2_4] = [M4, M3, M1, M2].
-                //
-                // Therefore:
-                // M2_1*pi1 + M2_2*pi2 + M2_3*pi3 + M2_4*pi4
-                // = M1*pi3 + M2*pi4 + M3*pi2 + M4*pi1.
-                [2, 3, 1, 0]
-            };
 
+        ckks_ensure!(pi.len() == 4 * theta, "{OP}: malformed pi encodings at slot {slot}");
+
+        if complex {
+            // Both coefficient halves reuse the same encrypted masks and
+            // the same canonical preparation of pi.
+            let mut acc_real = module.ckks_ciphertext_alloc(b2k_t, TorusPrecision(kk as u32));
+
+            let mut acc_imag = module.ckks_ciphertext_alloc(b2k_t, TorusPrecision(kk as u32));
+
+            ship_masking_accumulate_dual(module, &mut acc_real, &mut acc_imag, &plan, ik.masks(), pi, scratch)?;
+
+            // H-MUX is still executed independently for now.
+            //
+            // Both paths already share the same HMuxRotKey material;
+            // a later optimization can fuse these two evaluations.
+            for group in ik.mux_keys() {
+                ship_mux_rotate(module, &mut acc_real, group, &plans, scratch)?;
+
+                ship_mux_rotate(module, &mut acc_imag, group, &plans, scratch)?;
+            }
+
+            leaves[0].push(acc_real);
+            leaves[1].push(acc_imag);
+        } else {
             let mut acc = module.ckks_ciphertext_alloc(b2k_t, TorusPrecision(kk as u32));
 
-            ship_masking_accumulate(module, &mut acc, &plan, ik.masks(), pi, band_order, scratch)?;
+            ship_masking_accumulate(module, &mut acc, &plan, ik.masks(), pi, [0, 1, 2, 3], scratch)?;
 
             for group in ik.mux_keys() {
                 ship_mux_rotate(module, &mut acc, group, &plans, scratch)?;
             }
 
-            half_leaves.push(acc);
+            leaves[0].push(acc);
         }
     }
 
