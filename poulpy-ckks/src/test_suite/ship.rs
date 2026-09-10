@@ -529,6 +529,44 @@ fn ship_bootstrap_case<BE, F, E>(
     // FFT64 (f64 arithmetic) loses ~3 bits over the deep keyswitch chain and
     // ~2 more to the encapsulation switch at its toy base2k bottom modulus.
     let required_bits = if plan.log_delta_work() < 40 { 7.0 } else { 12.0 };
+
+    // Optional human-readable I/O dump for inspecting one real end-to-end SHIP
+    // test case.  Keep normal test output quiet unless explicitly requested.
+    if std::env::var_os("POULPY_SHIP_SHOW_IO").is_some() {
+        let show = m.min(8);
+        println!("\n=== SHIP bootstrap I/O ({}) ===", if complex { "complex" } else { "real" });
+        println!(
+            "N={n}, slots={m}, gamma=2^{}={}, raised_k={kk}, log_budget_out={}, max_err={max_err:.6e}, measured_bits={measured_bits:.3}, required_bits={required_bits:.3}",
+            plan.log_gamma(),
+            gamma,
+            out.log_budget(),
+        );
+        println!(
+            "{:<5} | {:>12} {:>12} | {:>12} {:>12} | {:>12} {:>12} | {:>10}",
+            "slot", "input_re", "input_im", "expect_re", "expect_im", "got_re", "got_im", "max_abs_err"
+        );
+        println!("{}", "-".repeat(105));
+        for i in 0..show {
+            let gr = got_re[i].to_f64().unwrap();
+            let gi = got_im[i].to_f64().unwrap();
+            let er = (gr - mu_quant_re[i]).abs();
+            let ei = (gi - mu_quant_im[i]).abs();
+            println!(
+                "{:<5} | {:>12.8} {:>12.8} | {:>12.8} {:>12.8} | {:>12.8} {:>12.8} | {:>10.3e}",
+                i,
+                mu_re[i],
+                mu_im[i],
+                mu_quant_re[i],
+                mu_quant_im[i],
+                gr,
+                gi,
+                er.max(ei),
+            );
+        }
+        println!("input_* = requested cleartext; expect_* = bottom-encoding-quantized cleartext actually used by the assertion");
+        println!("================================\n");
+    }
+
     assert!(
         measured_bits >= required_bits,
         "ship_bootstrap: precision {measured_bits:.2} bits < required {required_bits:.2}"
