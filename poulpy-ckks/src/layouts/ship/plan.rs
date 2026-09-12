@@ -49,10 +49,7 @@ impl ShipPlan {
             "SHIP log_delta_work must be at least 1, got {log_delta_work}"
         );
         let h = sparse_hamming_weight;
-        ensure!(
-            h > 0 && n.is_multiple_of(h),
-            "SHIP sparse Hamming weight {h} must be positive and divide N = {n}"
-        );
+        ensure!(h > 0 && h <= n, "SHIP sparse Hamming weight {h} must be in [1, N = {n}]");
         ensure!(window >= 1, "SHIP window must be at least 1, got {window}");
         ensure!(2 * window < n, "SHIP window {window} exceeds the ring degree {n}");
         ensure!(mux_base >= 2, "SHIP mux base must be at least 2, got {mux_base}");
@@ -123,9 +120,23 @@ impl ShipPlan {
         self.theta
     }
 
-    /// Spacing `N/h` between consecutive support positions.
+    /// Floor of the average spacing `N/h` between support positions.
+    ///
+    /// Kept for compatibility/diagnostics. For non-divisor `h`, support
+    /// geometry must use [`Self::support_center`] rather than repeatedly
+    /// adding this truncated value.
     pub fn spacing(&self) -> usize {
         self.n() / self.sparse_hamming_weight
+    }
+
+    /// Integer anchor of the ideal regularly-spaced position `slot * N / h`.
+    ///
+    /// SHIP allows `h` that does not divide the power-of-two ring degree
+    /// (notably h=31). We use floor(slot*N/h) as the compatibility anchor
+    /// for the existing integer-window representation.
+    pub fn support_center(&self, slot: usize) -> usize {
+        debug_assert!(slot < self.sparse_hamming_weight);
+        (((slot as u128) * (self.n() as u128)) / (self.sparse_hamming_weight as u128)) as usize
     }
 
     /// Bottom modulus `k0` in bits: a single limb.
@@ -163,10 +174,11 @@ impl ShipPlan {
         bases
     }
 
-    /// Public rotation `p_k = (k*N/h - w) mod m` folded into slot `k`'s masks.
+    /// Public rotation `p_k = (floor(k*N/h) - w) mod m` folded into
+    /// slot `k`'s masks.
     pub fn mask_rotation(&self, slot: usize) -> usize {
         let m = self.half_n() as i64;
-        ((slot * self.spacing()) as i64 - self.window as i64).rem_euclid(m) as usize
+        (self.support_center(slot) as i64 - self.window as i64).rem_euclid(m) as usize
     }
 }
 
@@ -177,8 +189,10 @@ mod tests {
     #[test]
     fn plan_validates_dimensions() {
         assert!(ShipPlan::new(10, 6, 36, 24, 32, 175, 5, 1).is_ok());
-        // h does not divide N.
-        assert!(ShipPlan::new(10, 6, 36, 24, 33, 175, 5, 1).is_err());
+        // Non-divisor h is valid: the SHIP paper uses h=31 with power-of-two N.
+        assert!(ShipPlan::new(10, 6, 36, 24, 31, 175, 5, 1).is_ok());
+        // h cannot exceed the ring degree.
+        assert!(ShipPlan::new(10, 6, 36, 24, 1025, 175, 5, 1).is_err());
         // theta exceeds the candidate count.
         assert!(ShipPlan::new(10, 6, 36, 24, 32, 2, 5, 6).is_err());
         // Degenerate mux base.
@@ -194,5 +208,15 @@ mod tests {
         let bases = plan.mux_bases();
         assert!(bases.iter().all(|&b| b <= 5));
         assert!(bases.iter().product::<usize>() >= plan.mux_candidates());
+    }
+
+    #[test]
+    fn nondivisor_support_centers_follow_floor_kn_over_h() {
+        let plan = ShipPlan::new(10, 6, 24, 12, 31, 7, 5, 1).unwrap();
+        assert_eq!(plan.support_center(0), 0);
+        assert_eq!(plan.support_center(1), 33);
+        assert_eq!(plan.support_center(15), 495);
+        assert_eq!(plan.support_center(30), 990);
+        assert_eq!(plan.tree_depth(), 5); // 31 secret leaves + pt0 = 32.
     }
 }

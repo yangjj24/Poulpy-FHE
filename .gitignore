@@ -6,3 +6,5 @@
 /ci-local.md
 
 *.patch
+
+/ship-regression-logs

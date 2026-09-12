@@ -349,6 +349,152 @@ impl<D: Data, BE: Backend> ShipKeysPrepared<D, BE> {
     }
 }
 
+/// Returns the scalar H-MUX selector used by the existing SHIP key generator.
+///
+/// For a mixed-radix digit of `base` and current place value `weight`, the
+/// selected candidate is exactly `(offset / weight) % base`.
+pub(crate) fn ship_mux_selector(offset: usize, weight: usize, base: usize, candidate: usize) -> bool {
+    debug_assert!(weight > 0);
+    debug_assert!(base > 0);
+    debug_assert!(candidate < base);
+    (offset / weight) % base == candidate
+}
+
+/// Materializes one sheared packed selector in physical slot order.
+///
+/// `support_offsets[r]` is the ordinary SHIP offset of secret branch `r`.
+/// Physical residue lane `r < h` therefore carries the same scalar selector
+/// that the existing branch-wise key generator would use for branch `r`.
+/// The extra lane `r = h` carries the public `pt_b` factor and always selects
+/// candidate zero so that it passes every BRotMux digit unchanged.
+#[allow(dead_code)]
+
+/// Packed selector for a sheared state with optional identity padding.
+///
+/// Lanes `0..support_offsets.len()` are the sparse-secret branches. The next
+/// lane is the public `pt0` branch and any remaining lanes are product-tree
+/// padding. All non-support lanes select candidate zero for every digit, so
+/// their logical rotation is the identity.
+pub(crate) fn ship_sheared_packed_beta_padded(
+    support_offsets: &[usize],
+    groups: usize,
+    weight: usize,
+    base: usize,
+    candidate: usize,
+    slots: usize,
+) -> Vec<bool> {
+    debug_assert!(groups > support_offsets.len());
+    debug_assert!(groups <= slots);
+    debug_assert_eq!(slots % groups, 0);
+    debug_assert!(base > 0 && candidate < base);
+    debug_assert!(weight > 0);
+
+    (0..slots)
+        .map(|p| {
+            let lane = p % groups;
+            if lane < support_offsets.len() {
+                ship_mux_selector(support_offsets[lane], weight, base, candidate)
+            } else {
+                candidate == 0
+            }
+        })
+        .collect()
+}
+
+/// Compatibility helper for the original unpadded `h + 1` layout.
+pub(crate) fn ship_sheared_packed_beta(
+    support_offsets: &[usize],
+    weight: usize,
+    base: usize,
+    candidate: usize,
+    slots: usize,
+) -> Vec<bool> {
+    ship_sheared_packed_beta_padded(support_offsets, support_offsets.len() + 1, weight, base, candidate, slots)
+}
+
+#[cfg(test)]
+mod sheared_selector_tests {
+    use super::ship_sheared_packed_beta_padded;
+
+    use super::{ship_mux_selector, ship_sheared_packed_beta};
+
+    #[test]
+    fn sheared_packed_beta_matches_scalar_selectors_and_public_lane() {
+        let offsets: Vec<usize> = (0..31).map(|r| (17 * r + 3) % 256).collect();
+        let groups = offsets.len() + 1;
+        let slots = groups * 8;
+
+        for (weight, base) in [(4usize, 4usize), (16, 3), (48, 2)] {
+            let packed: Vec<Vec<bool>> = (0..base)
+                .map(|candidate| ship_sheared_packed_beta(&offsets, weight, base, candidate, slots))
+                .collect();
+
+            for p in 0..slots {
+                let lane = p % groups;
+                let expected_candidate = if lane < offsets.len() {
+                    (offsets[lane] / weight) % base
+                } else {
+                    0
+                };
+
+                for candidate in 0..base {
+                    assert_eq!(packed[candidate][p], candidate == expected_candidate);
+                    if lane < offsets.len() {
+                        assert_eq!(
+                            packed[candidate][p],
+                            ship_mux_selector(offsets[lane], weight, base, candidate)
+                        );
+                    }
+                }
+                assert_eq!(packed.iter().filter(|beta| beta[p]).count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn sheared_packed_beta_supports_public_and_padding_lanes() {
+        const H: usize = 32;
+        const GROUPS: usize = 64;
+        const SLOTS: usize = 128;
+
+        let support_offsets: Vec<usize> = (0..H).map(|r| (37 * r + 3) % SLOTS).collect();
+
+        for &(weight, base) in &[(4usize, 4usize), (16, 4), (64, 2)] {
+            let packed: Vec<Vec<bool>> = (0..base)
+                .map(|candidate| ship_sheared_packed_beta_padded(&support_offsets, GROUPS, weight, base, candidate, SLOTS))
+                .collect();
+
+            for p in 0..SLOTS {
+                assert_eq!(
+                    packed.iter().filter(|beta| beta[p]).count(),
+                    1,
+                    "selector partition failed at p={p}, weight={weight}, base={base}"
+                );
+
+                let lane = p % GROUPS;
+                if lane < H {
+                    for candidate in 0..base {
+                        assert_eq!(
+                            packed[candidate][p],
+                            ship_mux_selector(support_offsets[lane], weight, base, candidate,),
+                            "support lane mismatch: p={p}, lane={lane}, candidate={candidate}"
+                        );
+                    }
+                } else {
+                    // lane H is pt0; H+1..GROUPS-1 are padding.
+                    assert!(packed[0][p], "public/padding lane {lane} must select candidate zero");
+                    for candidate in 1..base {
+                        assert!(
+                            !packed[candidate][p],
+                            "public/padding lane {lane} selected nonzero candidate {candidate}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Encrypts one [`HMuxRotKey`] for test bit `beta` and rotation amount `rot`
 /// at ciphertext precision `k_ct`.
 #[allow(clippy::too_many_arguments)]
@@ -397,6 +543,117 @@ where
         sk_out_host.data_mut().at_mut(0, 0),
     );
     // An automorphism preserves the distribution.
+    *sk_out_host.dist_mut() = *sk_dense_host.dist();
+    let mut sk_out = module.glwe_secret_alloc_from_infos(&sk_out_host);
+    sk_out_host.transfer_into(&mut sk_out);
+
+    let b2k = base2k.as_usize();
+    let ksk_infos = EncryptionLayout::new_from_default_sigma(GLWESwitchingKeyLayout {
+        n,
+        base2k,
+        dnum: k_ct.div_ceil(b2k * dsize).into(),
+        k_aux: (b2k * dsize).into(),
+        rank_in: Rank(2),
+        rank_out: Rank(1),
+        dsize: dsize.into(),
+    })?;
+    let mut key = module.glwe_switching_key_alloc_from_infos(&ksk_infos);
+    module.glwe_switching_key_encrypt_sk(&mut key, &sk_in, &sk_out, &ksk_infos, source_xe, source_xa, scratch);
+    Ok(HMuxRotKey { key, gal_el })
+}
+
+/// Exact negacyclic product in Z[X]/(X^N + 1), used only during experimental
+/// packed H-MUX key generation. The dense CKKS secret is sparse, so zero secret
+/// coefficients are skipped.
+fn ship_negacyclic_mul_i64(lhs: &[i64], rhs: &[i64], out: &mut [i64]) -> Result<()> {
+    ensure!(
+        lhs.len() == rhs.len() && lhs.len() == out.len(),
+        "SHIP packed H-MUX polynomial sizes differ"
+    );
+    let n = lhs.len();
+    out.fill(0);
+
+    for (j, &s_j) in rhs.iter().enumerate() {
+        if s_j == 0 {
+            continue;
+        }
+        for (i, &a_i) in lhs.iter().enumerate() {
+            if a_i == 0 {
+                continue;
+            }
+            let ij = i + j;
+            let (idx, sign) = if ij < n { (ij, 1i128) } else { (ij - n, -1i128) };
+            let term = (a_i as i128) * (s_j as i128) * sign;
+            let value = (out[idx] as i128)
+                .checked_add(term)
+                .ok_or_else(|| anyhow::anyhow!("SHIP packed H-MUX negacyclic product overflows i128"))?;
+            ensure!(
+                value >= i64::MIN as i128 && value <= i64::MAX as i128,
+                "SHIP packed H-MUX negacyclic product does not fit i64"
+            );
+            out[idx] = value as i64;
+        }
+    }
+    Ok(())
+}
+
+/// Encrypts one experimental packed H-MUX switching key.
+///
+/// `beta_hat` is the fixed-point coefficient polynomial encoding a packed
+/// slot selector. The rank-2 input secret is
+/// `(beta_hat * s, beta_hat)`. The evaluator removes the fixed-point scale
+/// with the final H-MUX normalization offset.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hmux_rot_packed_key_encrypt_sk<BE>(
+    module: &Module<BE>,
+    host_module: &Module<HostBytesBackend>,
+    sk_dense_host: &GLWESecret<Vec<u8>, i64>,
+    beta_hat: &[i64],
+    rot: usize,
+    k_ct: usize,
+    base2k: Base2K,
+    dsize: usize,
+    source_xe: &mut Source,
+    source_xa: &mut Source,
+    scratch: &mut ScratchArena<'_, BE>,
+) -> Result<HMuxRotKey<BE::OwnedBuf, BE::ZnxWord>>
+where
+    BE: HostStaged,
+    BE::OwnedBuf: HostDataRef + HostDataMut,
+    Module<BE>: GLWESwitchingKeyEncryptSk<BE> + ModuleCoreAlloc<OwnedBuf = BE::OwnedBuf, ZnxWord = BE::ZnxWord> + GaloisElement,
+    Module<HostBytesBackend>: ModuleCoreAlloc<OwnedBuf = Vec<u8>, ZnxWord = i64>,
+{
+    let n = sk_dense_host.n();
+    let n_usize = n.as_usize();
+    let m = n_usize / 2;
+    ensure!(
+        beta_hat.len() == n_usize,
+        "SHIP packed H-MUX selector polynomial has length {}, expected {}",
+        beta_hat.len(),
+        n_usize
+    );
+    let gal_el = module.galois_element(((m - (rot % m)) % m) as i64);
+
+    let mut sk_in_host = host_module.glwe_secret_alloc_from_infos(&GLWESecretLayout { n, rank: Rank(2) });
+    sk_in_host.data_mut().zero();
+    {
+        let dense_s = sk_dense_host.data().at(0, 0);
+        let data = sk_in_host.data_mut();
+        ship_negacyclic_mul_i64(beta_hat, dense_s, data.at_mut(0, 0))?;
+        data.at_mut(1, 0).copy_from_slice(beta_hat);
+    }
+    *sk_in_host.dist_mut() = Distribution::ENCAPSULATED("ship");
+
+    let mut sk_in = module.glwe_secret_alloc_from_infos(&sk_in_host);
+    sk_in_host.transfer_into(&mut sk_in);
+
+    let mut sk_out_host = host_module.glwe_secret_alloc_from_infos(&GLWESecretLayout { n, rank: Rank(1) });
+    sk_out_host.data_mut().zero();
+    znx_automorphism_apply(
+        module.galois_element_inv(gal_el),
+        sk_dense_host.data().at(0, 0),
+        sk_out_host.data_mut().at_mut(0, 0),
+    );
     *sk_out_host.dist_mut() = *sk_dense_host.dist();
     let mut sk_out = module.glwe_secret_alloc_from_infos(&sk_out_host);
     sk_out_host.transfer_into(&mut sk_out);
@@ -521,14 +778,13 @@ impl<D: Data> ShipKeySet<D, i64> {
             let mut mux_keys = Vec::with_capacity(bases.len());
             let mut weight = theta;
             for &b in &bases {
-                let digit = (u / weight) % b;
                 let mut group = Vec::with_capacity(b);
                 for d in 0..b {
                     group.push(hmux_rot_key_encrypt_sk(
                         module,
                         host_module,
                         sk_dense_host,
-                        d == digit,
+                        ship_mux_selector(u, weight, b, d),
                         (d * weight) % m,
                         kk,
                         base2k,

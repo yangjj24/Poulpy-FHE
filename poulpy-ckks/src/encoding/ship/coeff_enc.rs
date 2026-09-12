@@ -32,6 +32,100 @@ fn phases<F: ShipScalar>(residues: &[i64], base2k: usize) -> Result<(Vec<F>, Vec
     Ok((cos, sin))
 }
 
+/// Clear slot-domain SHIP material before CKKS plaintext encoding.
+///
+/// This is the source-of-truth representation used by
+/// `ship_coeff_encodings_host`. Keeping it separate lets regression tests
+/// inspect the real SHIP `pt0`/`pi` values even when their encoded torus width
+/// exceeds the host plaintext decoder's 127-bit limit.
+pub(crate) struct ShipCoeffSlotValues<F> {
+    pub(crate) pt0: (Vec<F>, Vec<F>),
+    pub(crate) pt0_2: Option<(Vec<F>, Vec<F>)>,
+    pub(crate) pi: Vec<Vec<(Vec<F>, Vec<F>)>>,
+}
+
+pub(crate) fn ship_coeff_slot_values_host<D, F>(
+    ct: &CKKSCiphertext<D, i64>,
+    plan: &ShipPlan,
+    base2k: Base2K,
+    complex: bool,
+) -> Result<ShipCoeffSlotValues<F>>
+where
+    D: HostDataRef,
+    F: ShipScalar,
+{
+    let n = plan.n();
+    let m = plan.half_n();
+    let b2k = base2k.as_usize();
+
+    ensure!(
+        (1..63).contains(&b2k) && (b2k as u32) < F::MANTISSA_BITS,
+        "SHIP base2k {b2k} must be in [1, 63) and below the scalar's {} mantissa bits",
+        F::MANTISSA_BITS
+    );
+    ensure!(
+        ct.n().as_usize() == n,
+        "SHIP bottom ciphertext degree {} does not match plan degree {n}",
+        ct.n()
+    );
+    ensure!(
+        ct.rank().as_usize() == 1,
+        "SHIP bottom ciphertext must have rank 1, got {}",
+        ct.rank()
+    );
+    ensure!(
+        ct.base2k() == base2k && ct.k().as_usize() == b2k,
+        "SHIP bottom ciphertext must span a single limb of base2k {base2k}, got base2k {} and width {}",
+        ct.base2k(),
+        ct.k()
+    );
+
+    let body = glwe_column_residues(ct.data(), 0, b2k, b2k)?;
+    let mask = glwe_column_residues(ct.data(), 1, b2k, b2k)?;
+
+    let gamma_4pi = F::from_i64(1i64 << plan.log_gamma()).context("SHIP gamma is not representable by the working scalar")?
+        / (F::PI() * F::from_f64(4.0).expect("4 is exact"));
+
+    let (body_cos, body_sin) = phases::<F>(&body, b2k)?;
+    let clear_pt0 = |off: usize| {
+        let re: Vec<F> = (0..m).map(|i| gamma_4pi * body_sin[i + off]).collect();
+        let im: Vec<F> = (0..m).map(|i| -gamma_4pi * body_cos[i + off]).collect();
+        (re, im)
+    };
+
+    let pt0 = clear_pt0(0);
+    let pt0_2 = complex.then(|| clear_pt0(m));
+
+    let (cos, sin) = phases::<F>(&mask, b2k)?;
+    let theta = plan.theta();
+    let mut pi = Vec::with_capacity(plan.sparse_hamming_weight());
+
+    for slot in 0..plan.sparse_hamming_weight() {
+        let p = plan.mask_rotation(slot);
+        let mut slot_pi = Vec::with_capacity(4 * theta);
+
+        for c in 0..theta {
+            let rot = (p + c) % m;
+            for (half, conj) in [(0usize, false), (0, true), (m, false), (m, true)] {
+                let mut re = Vec::with_capacity(m);
+                let mut im = Vec::with_capacity(m);
+
+                for i in 0..m {
+                    let src = half + (i + m - rot) % m;
+                    re.push(cos[src]);
+                    im.push(if conj { -sin[src] } else { sin[src] });
+                }
+
+                slot_pi.push((re, im));
+            }
+        }
+
+        pi.push(slot_pi);
+    }
+
+    Ok(ShipCoeffSlotValues { pt0, pt0_2, pi })
+}
+
 fn encode_reim_pt<BE, F>(
     module: &Module<BE>,
     base2k: Base2K,
@@ -74,80 +168,32 @@ pub fn ship_coeff_encodings_host<BE, D, F>(
     complex: bool,
 ) -> Result<ShipCoeffEncodings<BE::OwnedBuf, BE::ZnxWord>>
 where
-    // Host reference encoder: recomposes the ciphertext limbs through the i64
-    // `decode_vec_i64` path, so it applies only to an i64-word backend. Device
-    // backends bypass it via the OEP impl.
     BE: Backend<ZnxWord = i64>,
     Module<BE>: CKKSModuleAlloc<BE> + CKKSEncodingOps<BE, F>,
     D: HostDataRef,
     F: ShipScalar,
 {
-    let n = plan.n();
-    let m = plan.half_n();
+    let clear = ship_coeff_slot_values_host::<D, F>(ct, plan, base2k, complex)?;
+
     let b2k = base2k.as_usize();
-    ensure!(
-        (1..63).contains(&b2k) && (b2k as u32) < F::MANTISSA_BITS,
-        "SHIP base2k {b2k} must be in [1, 63) and below the scalar's {} mantissa bits",
-        F::MANTISSA_BITS
-    );
-    ensure!(
-        ct.n().as_usize() == n,
-        "SHIP bottom ciphertext degree {} does not match plan degree {n}",
-        ct.n()
-    );
-    ensure!(
-        ct.rank().as_usize() == 1,
-        "SHIP bottom ciphertext must have rank 1, got {}",
-        ct.rank()
-    );
-    ensure!(
-        ct.base2k() == base2k && ct.k().as_usize() == b2k,
-        "SHIP bottom ciphertext must span a single limb of base2k {base2k}, got base2k {} and width {}",
-        ct.base2k(),
-        ct.k()
-    );
-
-    let body = glwe_column_residues(ct.data(), 0, b2k, b2k)?;
-    let mask = glwe_column_residues(ct.data(), 1, b2k, b2k)?;
-
     let kk = plan.raised_k(b2k);
     let ld = plan.log_delta_work();
-    let gamma_4pi = F::from_i64(1i64 << plan.log_gamma()).context("SHIP gamma is not representable by the working scalar")?
-        / (F::PI() * F::from_f64(4.0).expect("4 is exact"));
-
-    // pt0 carries gamma/(4*i*pi): (gamma/4pi) * (sin(phi_b), -cos(phi_b)).
-    let (body_cos, body_sin) = phases::<F>(&body, b2k)?;
-    let encode_pt0 = |off: usize| -> Result<CKKSPlaintextOwned<BE>> {
-        let re: Vec<F> = (0..m).map(|i| gamma_4pi * body_sin[i + off]).collect();
-        let im: Vec<F> = (0..m).map(|i| -gamma_4pi * body_cos[i + off]).collect();
-        encode_reim_pt(module, base2k, kk, ld, &re, &im)
-    };
-    let pt0 = encode_pt0(0)?;
-    let pt0_2 = if complex { Some(encode_pt0(m)?) } else { None };
-
-    // The four `Rot_{p+c}(Ecd(pi_k(a)))` vectors per candidate and support
-    // slot, gathered from the hoisted mask phases.
-    let (cos, sin) = phases::<F>(&mask, b2k)?;
-    let theta = plan.theta();
     let k_pi = ld + b2k;
-    let mut pi = Vec::with_capacity(plan.sparse_hamming_weight());
-    for slot in 0..plan.sparse_hamming_weight() {
-        let p = plan.mask_rotation(slot);
-        let mut slot_pi = Vec::with_capacity(4 * theta);
-        for c in 0..theta {
-            let rot = (p + c) % m;
-            for (half, conj) in [(0, false), (0, true), (m, false), (m, true)] {
-                let mut re = Vec::with_capacity(m);
-                let mut im = Vec::with_capacity(m);
-                for i in 0..m {
-                    let src = half + (i + m - rot) % m;
-                    re.push(cos[src]);
-                    im.push(if conj { -sin[src] } else { sin[src] });
-                }
-                slot_pi.push(encode_reim_pt(module, base2k, k_pi, ld, &re, &im)?);
-            }
+
+    let pt0 = encode_reim_pt(module, base2k, kk, ld, &clear.pt0.0, &clear.pt0.1)?;
+
+    let pt0_2 = match clear.pt0_2 {
+        Some((re, im)) => Some(encode_reim_pt(module, base2k, kk, ld, &re, &im)?),
+        None => None,
+    };
+
+    let mut pi = Vec::with_capacity(clear.pi.len());
+    for slot_pi in clear.pi {
+        let mut encoded = Vec::with_capacity(slot_pi.len());
+        for (re, im) in slot_pi {
+            encoded.push(encode_reim_pt(module, base2k, k_pi, ld, &re, &im)?);
         }
-        pi.push(slot_pi);
+        pi.push(encoded);
     }
 
     Ok(ShipCoeffEncodings { pt0, pt0_2, pi })

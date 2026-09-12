@@ -83,16 +83,15 @@ where
     2 * module.bytes_of_vec_znx_dft(2, a_size) + 2 * pair + mux.max(finalize)
 }
 
-/// Hoisted B-to-1 mux-rotate: `ct <- sum_d beta_d * Rot_{rot_d}(ct)` over the
-/// keys of one digit position. The rank-2 input `(0, a_mask, a_body)` is
-/// DFT'd once and shared by every key; each key contributes one VMP followed
-/// by its DFT-domain output automorphism, and a single IDFT + normalize
-/// closes the position.
-pub(crate) fn ship_mux_rotate<BE>(
+/// Hoisted B-to-1 mux-rotate with an explicit bit offset at the final
+/// normalization. Ordinary SHIP uses offset zero; packed selectors use a
+/// negative offset to remove their fixed-point encoding scale.
+pub(crate) fn ship_mux_rotate_with_offset<BE>(
     module: &Module<BE>,
     ct: &mut CKKSCiphertextOwned<BE>,
     keys: &[HMuxRotKeyPrepared<BE::OwnedBuf, BE>],
     plans: &ShipMuxPlans<BE>,
+    res_offset: i64,
     scratch: &mut ScratchArena<'_, BE>,
 ) -> Result<()>
 where
@@ -189,7 +188,7 @@ where
                 ct_mut.data_mut(),
                 base2k,
                 k,
-                0,
+                res_offset,
                 col,
                 &res_big_ref,
                 base2k,
@@ -199,6 +198,215 @@ where
         }
     }
     Ok(())
+}
+
+/// Fused multi-source H-MUX with an explicit final normalization offset.
+///
+/// `sources[j]` is paired with `keys[j]`.  Unlike [`ship_mux_rotate_with_offset`],
+/// which hoists one source ciphertext across several selector keys, this routine
+/// accepts a different source ciphertext for every selector/rotation term:
+///
+/// `out <- sum_j HMuxRot(keys[j], sources[j])`.
+///
+/// The source DFT buffer and product/rotation temporaries are reused term by
+/// term; only the DFT-domain accumulator remains live across all terms.  Thus
+/// all products share one final IDFT + normalization.
+pub(crate) fn ship_mux_rotate_multi_source_refs_with_offset<BE>(
+    module: &Module<BE>,
+    out: &mut CKKSCiphertextOwned<BE>,
+    sources: &[&CKKSCiphertextOwned<BE>],
+    keys: &[&HMuxRotKeyPrepared<BE::OwnedBuf, BE>],
+    plans: &ShipMuxPlans<BE>,
+    res_offset: i64,
+    scratch: &mut ScratchArena<'_, BE>,
+) -> Result<()>
+where
+    BE: Backend,
+    Module<BE>: VecZnxDftApply<BE>
+        + VecZnxDftZero<BE>
+        + VecZnxDftAddAssign<BE>
+        + VecZnxDftAutomorphism<BE>
+        + VecZnxIdftApplyTmpA<BE>
+        + VecZnxBigNormalize<BE>
+        + VecZnxDftBytesOf
+        + GGLWEProductDefault<BE>,
+    CKKSCiphertextOwned<BE>: GLWEToBackendMut<BE> + GLWEToBackendRef<BE>,
+{
+    const OP: &str = "ship_mux_rotate_multi_source_refs";
+    ckks_ensure!(!sources.is_empty(), "{OP}: empty source list");
+    ckks_ensure!(
+        sources.len() == keys.len(),
+        "{OP}: source/key count mismatch ({} vs {})",
+        sources.len(),
+        keys.len()
+    );
+
+    let first = sources[0];
+    let a_size = first.size();
+    let key_size = keys[0].key.size();
+    let base2k = first.base2k().as_usize();
+    let k = first.k().as_usize();
+
+    ckks_ensure!(
+        out.base2k().as_usize() == base2k && out.k().as_usize() == k,
+        "{OP}: output/source precision mismatch"
+    );
+
+    for (source, key) in sources.iter().zip(keys.iter()) {
+        ckks_ensure!(source.size() == a_size, "{OP}: inconsistent source sizes");
+        ckks_ensure!(
+            source.base2k().as_usize() == base2k && source.k().as_usize() == k,
+            "{OP}: inconsistent source precision"
+        );
+        ckks_ensure!(key.key.size() == key_size, "{OP}: inconsistent key sizes");
+        ckks_ensure!(key.key.base2k().as_usize() == base2k, "{OP}: ciphertext/key base2k mismatch");
+    }
+
+    // `keys.len()` is the total number of products that share this accumulator;
+    // exact backends use it to select the safe shortened accumulation width.
+    let term_count = keys.len();
+    let output_size = gglwe_product_accumulation_output_size::<BE, _, _, _>(first, first, &keys[0].key, term_count);
+
+    let scratch = scratch.borrow();
+    let (mut a_dft, scratch_1) = scratch.take_vec_znx_dft_scratch(module, 2, a_size);
+    let (mut sum_dft, mut scratch_2) = scratch_1.take_vec_znx_dft_scratch(module, 2, output_size);
+
+    {
+        let mut sum_dft_mut = sum_dft.to_backend_mut();
+        for col in 0..2 {
+            module.vec_znx_dft_zero(&mut sum_dft_mut, col);
+        }
+
+        let (mut prod_dft, scratch_3) = scratch_2.borrow().take_vec_znx_dft_scratch(module, 2, output_size);
+        let (mut rot_dft, mut scratch_4) = scratch_3.take_vec_znx_dft_scratch(module, 2, output_size);
+
+        for (source, key) in sources.iter().zip(keys.iter()) {
+            {
+                let source_ref = GLWEToBackendRef::<BE>::to_backend_ref(*source);
+                let mut a_dft_mut = a_dft.to_backend_mut();
+                module.vec_znx_dft_apply(1, 0, &mut a_dft_mut, 0, source_ref.data(), 1);
+                module.vec_znx_dft_apply(1, 0, &mut a_dft_mut, 1, source_ref.data(), 0);
+            }
+
+            {
+                let a_dft_ref = a_dft.to_backend_ref();
+                let mut prod_dft_mut = prod_dft.to_backend_mut();
+                module.gglwe_product_dft_default(
+                    &mut prod_dft_mut,
+                    &a_dft_ref,
+                    &key.key.to_backend_ref(),
+                    term_count,
+                    &mut scratch_4.borrow(),
+                );
+            }
+
+            if key.gal_el == 1 {
+                let prod_ref = prod_dft.to_backend_ref();
+                for col in 0..2 {
+                    module.vec_znx_dft_add_assign(&mut sum_dft_mut, col, &prod_ref, col);
+                }
+            } else {
+                let plan = plans
+                    .get(&key.gal_el)
+                    .ok_or_else(|| anyhow::anyhow!("{OP}: missing automorphism plan for Galois element {}", key.gal_el))?;
+
+                {
+                    let prod_ref = prod_dft.to_backend_ref();
+                    let mut rot_dft_mut = rot_dft.to_backend_mut();
+                    for col in 0..2 {
+                        module.vec_znx_dft_automorphism_with_plan(plan, &mut rot_dft_mut, col, &prod_ref, col);
+                    }
+                }
+
+                let rot_ref = rot_dft.to_backend_ref();
+                for col in 0..2 {
+                    module.vec_znx_dft_add_assign(&mut sum_dft_mut, col, &rot_ref, col);
+                }
+            }
+        }
+    }
+
+    let (mut res_big, mut scratch_3) = scratch_2.take_vec_znx_big_scratch(module, 2, output_size);
+    {
+        let mut res_big_mut = res_big.to_backend_mut();
+        let mut sum_dft_mut = sum_dft.to_backend_mut();
+        for col in 0..2 {
+            module.vec_znx_idft_apply_tmpa(&mut res_big_mut, col, &mut sum_dft_mut, col);
+        }
+    }
+
+    {
+        let res_big_ref = res_big.to_backend_ref();
+        let mut out_mut = out.to_backend_mut();
+        for col in 0..2 {
+            module.vec_znx_big_normalize(
+                out_mut.data_mut(),
+                base2k,
+                k,
+                res_offset,
+                col,
+                &res_big_ref,
+                base2k,
+                col,
+                &mut scratch_3.borrow(),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Compatibility wrapper for callers that own a contiguous key group.
+///
+/// The borrowed-key variant above is the actual implementation. Keeping this
+/// wrapper preserves the Phase-3C/4A call sites while allowing Phase 4C and the
+/// eventual SHIP runtime to reuse one prepared key in several output groups.
+pub(crate) fn ship_mux_rotate_multi_source_with_offset<BE>(
+    module: &Module<BE>,
+    out: &mut CKKSCiphertextOwned<BE>,
+    sources: &[&CKKSCiphertextOwned<BE>],
+    keys: &[HMuxRotKeyPrepared<BE::OwnedBuf, BE>],
+    plans: &ShipMuxPlans<BE>,
+    res_offset: i64,
+    scratch: &mut ScratchArena<'_, BE>,
+) -> Result<()>
+where
+    BE: Backend,
+    Module<BE>: VecZnxDftApply<BE>
+        + VecZnxDftZero<BE>
+        + VecZnxDftAddAssign<BE>
+        + VecZnxDftAutomorphism<BE>
+        + VecZnxIdftApplyTmpA<BE>
+        + VecZnxBigNormalize<BE>
+        + VecZnxDftBytesOf
+        + GGLWEProductDefault<BE>,
+    CKKSCiphertextOwned<BE>: GLWEToBackendMut<BE> + GLWEToBackendRef<BE>,
+{
+    let key_refs: Vec<_> = keys.iter().collect();
+    ship_mux_rotate_multi_source_refs_with_offset(module, out, sources, &key_refs, plans, res_offset, scratch)
+}
+
+/// Ordinary scalar-selector H-MUX: no extra fixed-point scale.
+pub(crate) fn ship_mux_rotate<BE>(
+    module: &Module<BE>,
+    ct: &mut CKKSCiphertextOwned<BE>,
+    keys: &[HMuxRotKeyPrepared<BE::OwnedBuf, BE>],
+    plans: &ShipMuxPlans<BE>,
+    scratch: &mut ScratchArena<'_, BE>,
+) -> Result<()>
+where
+    BE: Backend,
+    Module<BE>: VecZnxDftApply<BE>
+        + VecZnxDftZero<BE>
+        + VecZnxDftAddAssign<BE>
+        + VecZnxDftAutomorphism<BE>
+        + VecZnxIdftApplyTmpA<BE>
+        + VecZnxBigNormalize<BE>
+        + VecZnxDftBytesOf
+        + GGLWEProductDefault<BE>,
+    CKKSCiphertextOwned<BE>: GLWEToBackendMut<BE> + GLWEToBackendRef<BE>,
+{
+    ship_mux_rotate_with_offset(module, ct, keys, plans, 0, scratch)
 }
 
 /// Dual hoisted B-to-1 mux-rotate for the two complex SHIP coefficient halves.
@@ -407,6 +615,8 @@ pub(crate) fn ship_sheared_route_from_source(src: usize, logical_rot: usize, gro
 
 #[cfg(test)]
 mod sheared_layout_tests {
+    use super::ship_sheared_runtime_route_from_output;
+
     use super::{
         ship_sheared_branch, ship_sheared_logical_index, ship_sheared_route_from_output, ship_sheared_route_from_source,
     };
@@ -452,6 +662,95 @@ mod sheared_layout_tests {
                     let backward = ship_sheared_route_from_output(forward.group, logical_rot, groups);
                     assert_eq!(backward.group, src);
                     assert_eq!(backward.physical_rot, forward.physical_rot);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sheared_runtime_route_supports_g64_padding() {
+        const GROUPS: usize = 64;
+        const SLOTS: usize = 128;
+
+        for runtime_rot in [0usize, 4, 8, 12, 16, 32, 48, 64] {
+            for out in 0..GROUPS {
+                let route = ship_sheared_runtime_route_from_output(out, runtime_rot, GROUPS);
+
+                assert_eq!(route.physical_rot % GROUPS, 0);
+                assert_eq!((route.group + runtime_rot) % GROUPS, out);
+
+                for p in 0..SLOTS {
+                    let physical_p = (p + SLOTS - (route.physical_rot % SLOTS)) % SLOTS;
+                    let have = (physical_p + route.group) % SLOTS;
+                    let want = (p + out + SLOTS - (runtime_rot % SLOTS)) % SLOTS;
+
+                    assert_eq!(
+                        have, want,
+                        "G=64 route mismatch: rot={runtime_rot}, out={out}, p={p}, route={route:?}"
+                    );
+                    assert_eq!(
+                        physical_p % GROUPS,
+                        p % GROUPS,
+                        "G=64 physical rotation changed the fixed residue lane"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Maps one positive Poulpy/H-MUX rotation to the sheared layout.
+///
+/// Poulpy's runtime convention is `Rot_t(x)[i] = x[i - t]`. For
+///
+/// `Y_g[p] = x_{p mod G}[p + g]`,
+///
+/// output group `g` therefore consumes source group
+/// `s = (g - t) mod G` and only needs the physical rotation
+///
+/// `rho = s + t - g`,
+///
+/// which is always a non-negative multiple of `G`. Because `rho mod G = 0`,
+/// the fixed branch lane `p mod G` is preserved by the physical rotation.
+#[inline]
+pub(crate) fn ship_sheared_runtime_route_from_output(out: usize, runtime_rot: usize, groups: usize) -> ShipShearedRoute {
+    debug_assert!(groups != 0 && out < groups);
+    let t = runtime_rot % groups;
+    let src = (out + groups - t) % groups;
+    let physical_rot = src + runtime_rot - out;
+    debug_assert_eq!(physical_rot % groups, 0);
+    ShipShearedRoute {
+        group: src,
+        physical_rot,
+    }
+}
+
+#[cfg(test)]
+mod sheared_runtime_route_tests {
+    use super::{ship_sheared_branch, ship_sheared_logical_index, ship_sheared_runtime_route_from_output};
+
+    #[test]
+    fn runtime_route_matches_hmux_minus_rotation_convention() {
+        const GROUPS: usize = 32;
+        const SLOTS: usize = GROUPS * 8;
+
+        for out in 0..GROUPS {
+            for runtime_rot in 0..SLOTS {
+                let route = ship_sheared_runtime_route_from_output(out, runtime_rot, GROUPS);
+
+                assert_eq!(route.physical_rot % GROUPS, 0);
+                assert_eq!((route.group + runtime_rot) % GROUPS, out);
+
+                for p in 0..SLOTS {
+                    // Poulpy/H-MUX: positive rotation t reads input[p - t].
+                    let in_p = (p + SLOTS - (route.physical_rot % SLOTS)) % SLOTS;
+
+                    assert_eq!(ship_sheared_branch(in_p, GROUPS), ship_sheared_branch(p, GROUPS),);
+
+                    // Y_src[p-rho] = x_lane[p + out - runtime_rot].
+                    let got = ship_sheared_logical_index(in_p, route.group, SLOTS);
+                    let want = (p + out + SLOTS - (runtime_rot % SLOTS)) % SLOTS;
+                    assert_eq!(got, want);
                 }
             }
         }

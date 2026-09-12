@@ -634,27 +634,28 @@ where
 
         let a_base2k: usize = a.base2k().into();
         let key_base2k: usize = tsk.base2k().into();
-        let res_base2k: usize = res.base2k().into();
 
         let cols: usize = tsk.rank_out().as_usize() + 1;
         let pairs: usize = tsk.rank_in().as_usize();
 
-        // The operand's precision, not its limb count rounded back up: across
-        // radices the two disagree, and the product would be handed one limb
-        // too many.
-        let a_dft_size: usize = a.k().div_ceil(tsk.base2k()) as usize;
+        // Consume exactly the declared torus precision. A partial bottom limb
+        // must be canonicalized before it enters the FFT/VMP path, even when
+        // the tensor and tensor key use the same radix.
+        let a_k = a.k().as_usize();
+        let a_dft_size: usize = a_k.div_ceil(key_base2k);
+        let needs_canonical = a_base2k != key_base2k || !a_k.is_multiple_of(key_base2k);
         let output_size = gglwe_product_output_size::<BE, _, _, _>(res, a, tsk);
 
         let lvl_0: usize = self.bytes_of_vec_znx_dft(pairs, a_dft_size);
 
-        let lvl_1_pre_conv: usize = if a_base2k != key_base2k {
+        let lvl_1_pre_conv: usize = if needs_canonical {
             BE::bytes_of_vec_znx(self.n(), 1, a_dft_size) + self.vec_znx_normalize_tmp_bytes()
         } else {
             0
         };
         let lvl_1_res_dft: usize = self.bytes_of_vec_znx_dft(cols, output_size);
         let lvl_1_gglwe_product: usize = self.gglwe_product_dft_tmp_bytes_default(output_size, a_dft_size, tsk);
-        let lvl_1_post_conv: usize = if res_base2k != key_base2k {
+        let lvl_1_post_conv: usize = if needs_canonical {
             BE::bytes_of_vec_znx(self.n(), 1, a_dft_size) + self.vec_znx_normalize_tmp_bytes()
         } else {
             0
@@ -687,10 +688,11 @@ where
 
         let a_base2k: usize = a0.base2k().into();
         let key_base2k: usize = tsk.base2k().into();
-        let res_base2k: usize = res0.base2k().into();
         let cols: usize = tsk.rank_out().as_usize() + 1;
         let pairs: usize = tsk.rank_in().as_usize();
-        let a_dft_size: usize = a0.k().div_ceil(tsk.base2k()) as usize;
+        let a_k = a0.k().as_usize();
+        let a_dft_size: usize = a_k.div_ceil(key_base2k);
+        let needs_canonical = a_base2k != key_base2k || !a_k.is_multiple_of(key_base2k);
         let output_size0 = gglwe_product_output_size::<BE, _, _, _>(res0, a0, tsk);
         let output_size1 = gglwe_product_output_size::<BE, _, _, _>(res1, a1, tsk);
         assert_eq!(output_size0, output_size1, "dual tensor relinearization output sizes differ");
@@ -699,14 +701,14 @@ where
         // Both transformed tensor tails must remain live through the shared
         // gadget product. Conversion work itself is reused sequentially.
         let lvl_0 = 2 * self.bytes_of_vec_znx_dft(pairs, a_dft_size);
-        let lvl_1_pre_conv = if a_base2k != key_base2k {
+        let lvl_1_pre_conv = if needs_canonical {
             BE::bytes_of_vec_znx(self.n(), 1, a_dft_size) + self.vec_znx_normalize_tmp_bytes()
         } else {
             0
         };
         let lvl_1_res_dft = 2 * self.bytes_of_vec_znx_dft(cols, output_size);
         let lvl_1_gglwe_product = self.gglwe_product_dft_dual_tmp_bytes_default(output_size, a_dft_size, tsk);
-        let lvl_1_post_conv = if res_base2k != key_base2k {
+        let lvl_1_post_conv = if needs_canonical {
             BE::bytes_of_vec_znx(self.n(), 1, a_dft_size) + self.vec_znx_normalize_tmp_bytes()
         } else {
             0
@@ -750,11 +752,13 @@ where
         let cols: usize = tsk.rank_out().as_usize() + 1;
         let pairs: usize = tsk.rank_in().as_usize();
 
-        let a_dft_size: usize = a.k().div_ceil(tsk.base2k()) as usize;
+        let a_k = a.k().as_usize();
+        let a_dft_size: usize = a_k.div_ceil(key_base2k);
+        let needs_canonical = a_base2k != key_base2k || !a_k.is_multiple_of(key_base2k);
 
         let (mut a_dft, mut scratch) = scratch.take_vec_znx_dft_scratch(self, pairs, a_dft_size);
 
-        if a_base2k == key_base2k {
+        if !needs_canonical {
             for i in 0..pairs {
                 self.vec_znx_dft_apply(1, 0, &mut a_dft, i, &a_backend.data, cols + i);
             }
@@ -765,7 +769,7 @@ where
                 self.vec_znx_normalize(
                     &mut a_conv,
                     key_base2k,
-                    a_dft_size * key_base2k,
+                    a_k,
                     0,
                     0,
                     &a_backend.data,
@@ -790,7 +794,7 @@ where
             }
         }
 
-        if a_base2k == key_base2k {
+        if !needs_canonical {
             for i in 0..cols {
                 self.vec_znx_big_add_small_assign(&mut res_big, i, &a_backend.data, i);
             }
@@ -801,7 +805,7 @@ where
                 self.vec_znx_normalize(
                     &mut a_conv,
                     key_base2k,
-                    a_dft_size * key_base2k,
+                    a_k,
                     0,
                     0,
                     &a_backend.data,
@@ -875,7 +879,9 @@ where
 
         let cols: usize = tsk.rank_out().as_usize() + 1;
         let pairs: usize = tsk.rank_in().as_usize();
-        let a_dft_size: usize = a0.k().div_ceil(tsk.base2k()) as usize;
+        let a_k = a0.k().as_usize();
+        let a_dft_size: usize = a_k.div_ceil(key_base2k);
+        let needs_canonical = a_base2k != key_base2k || !a_k.is_multiple_of(key_base2k);
         let output_size0 = gglwe_product_output_size::<BE, _, _, _>(res0, a0, tsk);
         let output_size1 = gglwe_product_output_size::<BE, _, _, _>(res1, a1, tsk);
         assert_eq!(output_size0, output_size1, "dual tensor relinearization output sizes differ");
@@ -886,7 +892,7 @@ where
         let (mut a0_dft, scratch_1) = scratch.take_vec_znx_dft_scratch(self, pairs, a_dft_size);
         let (mut a1_dft, mut scratch_2) = scratch_1.take_vec_znx_dft_scratch(self, pairs, a_dft_size);
 
-        if a_base2k == key_base2k {
+        if !needs_canonical {
             for i in 0..pairs {
                 self.vec_znx_dft_apply(1, 0, &mut a0_dft, i, &a0_backend.data, cols + i);
                 self.vec_znx_dft_apply(1, 0, &mut a1_dft, i, &a1_backend.data, cols + i);
@@ -897,7 +903,7 @@ where
                 self.vec_znx_normalize(
                     &mut a_conv,
                     key_base2k,
-                    a_dft_size * key_base2k,
+                    a_k,
                     0,
                     0,
                     &a0_backend.data,
@@ -909,7 +915,7 @@ where
                 self.vec_znx_normalize(
                     &mut a_conv,
                     key_base2k,
-                    a_dft_size * key_base2k,
+                    a_k,
                     0,
                     0,
                     &a1_backend.data,
@@ -947,7 +953,7 @@ where
                     self.vec_znx_idft_apply_tmpa(&mut res_big_backend, i, &mut res_dft_backend, i);
                 }
             }
-            if a_base2k == key_base2k {
+            if !needs_canonical {
                 for i in 0..cols {
                     self.vec_znx_big_add_small_assign(&mut res_big, i, &a0_backend.data, i);
                 }
@@ -957,7 +963,7 @@ where
                     self.vec_znx_normalize(
                         &mut a_conv,
                         key_base2k,
-                        a_dft_size * key_base2k,
+                        a_k,
                         0,
                         0,
                         &a0_backend.data,
@@ -995,7 +1001,7 @@ where
                     self.vec_znx_idft_apply_tmpa(&mut res_big_backend, i, &mut res_dft_backend, i);
                 }
             }
-            if a_base2k == key_base2k {
+            if !needs_canonical {
                 for i in 0..cols {
                     self.vec_znx_big_add_small_assign(&mut res_big, i, &a1_backend.data, i);
                 }
@@ -1005,7 +1011,7 @@ where
                     self.vec_znx_normalize(
                         &mut a_conv,
                         key_base2k,
-                        a_dft_size * key_base2k,
+                        a_k,
                         0,
                         0,
                         &a1_backend.data,

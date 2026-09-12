@@ -11,7 +11,7 @@ use poulpy_hal::{
 use super::plan::ShipPlan;
 
 /// The support of a regularly-spaced sparse SHIP secret: the `k`-th nonzero
-/// coefficient sits at `(k*N/h + delta_k) mod N` with `delta_k` in `[-w, w]`
+/// coefficient sits near the ideal position `k*N/h`; the integer compatibility anchor is `floor(k*N/h)` and `delta_k` lies in `[-w, w]`
 /// and a uniform sign, all indices distinct, in `k` order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShipSecretSpec {
@@ -24,7 +24,6 @@ impl ShipSecretSpec {
         let n = plan.n();
         let h = plan.sparse_hamming_weight();
         let w = plan.window();
-        let spacing = plan.spacing();
         let values = (2 * w + 1) as u64;
         let mask = values.next_power_of_two() - 1;
         let mut used = vec![false; n];
@@ -32,7 +31,8 @@ impl ShipSecretSpec {
         for k in 0..h {
             loop {
                 let delta = source.next_u64n(values, mask) as i64 - w as i64;
-                let idx = ((k * spacing) as i64 + delta).rem_euclid(n as i64) as usize;
+                let center = plan.support_center(k) as i64;
+                let idx = (center + delta).rem_euclid(n as i64) as usize;
                 if !used[idx] {
                     used[idx] = true;
                     let sign = if source.next_u64n(2, 1) == 0 { 1 } else { -1 };
@@ -75,7 +75,7 @@ impl ShipSecretSpec {
         &self.support
     }
 
-    /// Windowed offset `u_k = (j_k - k*N/h + w) mod N` of slot `k`.
+    /// Windowed offset `u_k = (j_k - floor(k*N/h) + w) mod N` of slot `k`.
     pub fn offset(&self, plan: &ShipPlan, slot: usize) -> usize {
         offset_of(plan, slot, self.support[slot].0)
     }
@@ -100,7 +100,7 @@ impl ShipSecretSpec {
 
 fn offset_of(plan: &ShipPlan, slot: usize, idx: usize) -> usize {
     let n = plan.n() as i64;
-    (idx as i64 - (slot * plan.spacing()) as i64 + plan.window() as i64).rem_euclid(n) as usize
+    (idx as i64 - plan.support_center(slot) as i64 + plan.window() as i64).rem_euclid(n) as usize
 }
 
 #[cfg(test)]
@@ -115,6 +115,19 @@ mod tests {
         let revalidated = ShipSecretSpec::from_support(&plan, spec.support().to_vec()).unwrap();
         assert_eq!(spec, revalidated);
         for k in 0..plan.sparse_hamming_weight() {
+            assert!(spec.offset(&plan, k) <= 2 * plan.window());
+        }
+    }
+
+    #[test]
+    fn sampled_support_validates_for_h31() {
+        let plan = ShipPlan::new(8, 6, 24, 12, 31, 3, 4, 4).unwrap();
+        let mut source = Source::new([0x31u8; 32]);
+        let spec = ShipSecretSpec::sample(&plan, &mut source);
+        assert_eq!(spec.support().len(), 31);
+        let revalidated = ShipSecretSpec::from_support(&plan, spec.support().to_vec()).unwrap();
+        assert_eq!(spec, revalidated);
+        for k in 0..31 {
             assert!(spec.offset(&plan, k) <= 2 * plan.window());
         }
     }
